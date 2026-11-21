@@ -1,60 +1,122 @@
-cmake_minimum_required(VERSION 3.20)
-project(MemeStudio LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.24)
+project(MemeStudio VERSION 2.0.0 LANGUAGES CXX)
+
 if(NOT WIN32)
-    message(FATAL_ERROR "MemeStudio requires Windows 10 or newer.")
+    message(FATAL_ERROR "MemeStudio requires Windows 10 (1903+) or newer.")
 endif()
-add_library(MemeStudioCore STATIC src/util.cpp src/image.cpp src/api.cpp src/api_routing.cpp src/api_probe.cpp
-    src/job.cpp src/job_config.cpp src/batch.cpp src/drawing.cpp src/plugins.cpp src/refine.cpp src/upscale.cpp)
-add_executable(MemeStudio WIN32 src/main.cpp src/gui.cpp src/dsh.cpp src/dsh_dialog.cpp src/api_routing_dialog.cpp
-    src/api_comparison.cpp src/api_probe_dialog.cpp src/drawing_dialog.cpp tests/tests.cpp tests/api_probe_test.cpp
-    tests/routing_test.cpp tests/dsh_test.cpp)
-add_executable(MemeStudio-cli src/cli.cpp src/cli_config.cpp)
-target_compile_features(MemeStudioCore PUBLIC cxx_std_20)
-target_compile_definitions(MemeStudioCore PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(MemeStudioCore PUBLIC user32 gdi32 msimg32 windowscodecs ole32 oleaut32 uuid comctl32 comdlg32 shell32 shlwapi winhttp wintrust crypt32 bcrypt propsys advapi32)
-target_link_libraries(MemeStudio PRIVATE MemeStudioCore)
-target_link_libraries(MemeStudio-cli PRIVATE MemeStudioCore)
-add_dependencies(MemeStudio-cli MemeStudio)
+
+option(MEMESTUDIO_BUILD_GUI   "Build Win32 desktop application MemeStudio.exe" ON)
+option(MEMESTUDIO_BUILD_CLI   "Build headless CLI tool MemeStudio-cli.exe" ON)
+option(MEMESTUDIO_BUILD_TESTS "Build unit and E2E test suites" ON)
+
+add_library(meme_compiler_flags INTERFACE)
+target_compile_features(meme_compiler_flags INTERFACE cxx_std_20)
+target_compile_definitions(meme_compiler_flags INTERFACE
+    UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 if(MSVC)
-    foreach(target IN ITEMS MemeStudioCore MemeStudio MemeStudio-cli)
-        target_compile_options(${target} PRIVATE /utf-8 /W4 /EHsc)
-        set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    endforeach()
-    target_link_options(MemeStudio PRIVATE /ENTRY:wmainCRTStartup "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/src/app.manifest")
-    target_link_options(MemeStudio-cli PRIVATE "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/src/app.manifest")
+    target_compile_options(meme_compiler_flags INTERFACE /utf-8 /W4 /EHsc /permissive-)
 endif()
-foreach(plugin IN ITEMS example local-redraw waifu2x batch-convert prompt-draw api-parameter-test api-load-balancing qwen-image deepseek-harness)
-    set(plugin_target "MemeStudioPlugin-${plugin}")
-    add_library(${plugin_target} SHARED plugins/${plugin}/plugin.cpp)
-    target_compile_features(${plugin_target} PRIVATE cxx_std_20)
-    target_compile_definitions(${plugin_target} PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
-    if(plugin STREQUAL "qwen-image")
-        target_link_libraries(${plugin_target} PRIVATE user32 gdi32 ole32 uuid winhttp crypt32 bcrypt)
-        foreach(resource IN ITEMS server.py environment.py model_info.py sdcpp_backend.py requirements.txt README.md)
-            add_custom_command(TARGET MemeStudio POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:MemeStudio>/plugins/qwen-image"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/plugins/qwen-image/${resource}"
-                    "$<TARGET_FILE_DIR:MemeStudio>/plugins/qwen-image/${resource}")
-        endforeach()
-    endif()
-    set_target_properties(${plugin_target} PROPERTIES PREFIX "" OUTPUT_NAME "${plugin}")
+
+# 1. Pure Headless Microkernel Core (zero GUI / dialog / test code!)
+add_library(meme_core STATIC
+    src/base/utf8.cpp
+    src/base/crypto.cpp
+    src/base/fs_io.cpp
+    src/base/app_paths.cpp
+    src/base/managed_process.cpp
+    src/media/image_ops.cpp
+    src/media/wic_codec.cpp
+    src/net/endpoint.cpp
+    src/net/redactor.cpp
+    src/net/winhttp_pool.cpp
+    src/net/openai_client.cpp
+    src/core/config_store.cpp
+    src/core/prompt_builder.cpp
+    src/core/replace_engine.cpp
+    src/core/plugin_host.cpp
+)
+target_include_directories(meme_core PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/sdk")
+target_include_directories(meme_core SYSTEM PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor")
+target_link_libraries(meme_core
+    PUBLIC meme_compiler_flags
+    PRIVATE windowscodecs ole32 uuid propsys winhttp wintrust crypt32 bcrypt shlwapi advapi32 shell32)
+if(MSVC)
+    set_property(TARGET meme_core PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
+# 2. Pure Headless CLI (independent of MemeStudio GUI target, zero GDI/comctl32/comdlg32!)
+if(MEMESTUDIO_BUILD_CLI)
+    add_executable(MemeStudio-cli
+        src/cli/cli_main.cpp)
+    target_include_directories(MemeStudio-cli SYSTEM PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor")
+    target_link_libraries(MemeStudio-cli PRIVATE meme_core ole32)
     if(MSVC)
-        target_compile_options(${plugin_target} PRIVATE /utf-8 /W4 /EHsc)
-        set_property(TARGET ${plugin_target} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        set_property(TARGET MemeStudio-cli PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_link_options(MemeStudio-cli PRIVATE
+            /ENTRY:wmainCRTStartup
+            "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/src/gui/app.manifest")
     endif()
-    add_dependencies(MemeStudio ${plugin_target})
-    add_custom_command(TARGET MemeStudio POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:MemeStudio>/plugins/${plugin}"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${plugin_target}>" "$<TARGET_FILE_DIR:MemeStudio>/plugins/${plugin}/${plugin}.dll"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/plugins/${plugin}/plugin.json" "$<TARGET_FILE_DIR:MemeStudio>/plugins/${plugin}/plugin.json")
-endforeach()
-add_custom_command(TARGET MemeStudio POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:MemeStudio>/plugins/deepseek-harness/locale")
-foreach(resource IN ITEMS package.json cordis.patch.yml index.js icon.svg README.md locale/en.json locale/zh.json)
-    add_custom_command(TARGET MemeStudio POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/plugins/deepseek-harness/${resource}"
-            "$<TARGET_FILE_DIR:MemeStudio>/plugins/deepseek-harness/${resource}")
-endforeach()
-enable_testing()
-add_test(NAME studio-self-test COMMAND MemeStudio --self-test "${CMAKE_CURRENT_BINARY_DIR}/test-output")
-add_test(NAME studio-cli-help COMMAND MemeStudio-cli --help)
+endif()
+
+# 3. PerMonitorV2 DPI-Aware Win32 UIKit + Clean 3-Column Desktop App (zero tests/*.cpp linked!)
+if(MEMESTUDIO_BUILD_GUI)
+    add_library(meme_uikit STATIC
+        src/uikit/dpi.cpp
+        src/uikit/controls.cpp
+        src/uikit/file_dialogs.cpp
+        src/uikit/image_canvas.cpp
+        src/uikit/panel_manager.cpp)
+    target_include_directories(meme_uikit PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/sdk")
+    target_link_libraries(meme_uikit
+        PUBLIC meme_compiler_flags
+        PRIVATE user32 gdi32 msimg32 comctl32 comdlg32 shell32 ole32 uuid)
+    if(MSVC)
+        set_property(TARGET meme_uikit PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
+    add_executable(MemeStudio WIN32
+        src/gui/win_main.cpp
+        src/gui/presets_dialog.cpp
+        src/gui/plugin_dialog.cpp
+        src/gui/studio_window.cpp)
+    target_include_directories(MemeStudio SYSTEM PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor")
+    target_link_libraries(MemeStudio PRIVATE meme_core meme_uikit user32 gdi32 comctl32 shell32 ole32)
+    if(MSVC)
+        set_property(TARGET MemeStudio PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_link_options(MemeStudio PRIVATE
+            /ENTRY:wmainCRTStartup
+            "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/src/gui/app.manifest")
+    endif()
+endif()
+
+# 4. Standalone Automated Test Targets (never compiled into production MemeStudio.exe!)
+if(MEMESTUDIO_BUILD_TESTS)
+    enable_testing()
+    add_executable(MemeStudioTests
+        tests/unit/unit_tests.cpp)
+    target_include_directories(MemeStudioTests SYSTEM PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor")
+    target_link_libraries(MemeStudioTests PRIVATE meme_core ole32)
+    if(MSVC)
+        set_property(TARGET MemeStudioTests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_link_options(MemeStudioTests PRIVATE /ENTRY:wmainCRTStartup)
+    endif()
+    add_test(NAME meme-core-unit-tests COMMAND MemeStudioTests)
+
+    if(MEMESTUDIO_BUILD_CLI)
+        add_test(NAME meme-cli-help-smoke COMMAND MemeStudio-cli --help)
+        find_program(NODE_EXECUTABLE node)
+        if(NODE_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/cli_e2e.mjs")
+            add_test(
+                NAME meme-cli-e2e
+                COMMAND "${NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/cli_e2e.mjs" "$<TARGET_FILE:MemeStudio-cli>")
+        endif()
+    endif()
+endif()

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-package:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        if: matrix.arch == 'x64'
+        with:
+          node-version: '20'
+
+      - name: Build and Test (${{ matrix.arch }})
+        shell: pwsh
+        run: |
+          if ("${{ matrix.arch }}" -eq "x64") {
+            .\build.ps1 -Architecture x64 -Configuration Release -Test
+          } else {
+            .\build.ps1 -Architecture arm64 -Configuration Release
+          }
+
+      - name: Package Clean Distribution (${{ matrix.arch }})
+        shell: pwsh
+        run: .\package.ps1 -Architecture ${{ matrix.arch }} -SkipBuild
+
+      - name: Upload Release Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: MemeStudio-Windows-${{ matrix.arch }}
+          path: out/packages/MemeStudio-Windows-${{ matrix.arch }}.zip
+          if-no-files-found: error

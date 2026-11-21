@@ -1,60 +1,47 @@
 param(
     [ValidateSet("x64", "arm64")][string]$Architecture = "x64",
-    [string]$Executable = "",
-    [string]$BinaryDirectory = ""
+    [switch]$SkipBuild
 )
 $ErrorActionPreference = "Stop"
-$project = $PSScriptRoot
-$requestedBinary = $BinaryDirectory
-if ($Architecture -eq "x64") { $binaryDirectory = Join-Path $project "bin" }
-else { $binaryDirectory = Join-Path $project "bin\arm64" }
-if ($requestedBinary) {
-    $binaryDirectory = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($requestedBinary)) { $requestedBinary } else { Join-Path $project $requestedBinary }))
+
+$projectRoot = $PSScriptRoot
+if (-not $SkipBuild) {
+    & (Join-Path $projectRoot "build.ps1") -Architecture $Architecture -Configuration Release
 }
-if (!$Executable) {
-    $executableName = if ($Architecture -eq "x64") { "MemeStudio.exe" } else { "MemeStudio-arm64.exe" }
-    $Executable = Join-Path $binaryDirectory $executableName
+
+$binDir = Join-Path $projectRoot "out\bin\$Architecture\Release"
+$guiExe = Join-Path $binDir "MemeStudio.exe"
+$cliExe = Join-Path $binDir "MemeStudio-cli.exe"
+if (-not (Test-Path -LiteralPath $guiExe) -or -not (Test-Path -LiteralPath $cliExe)) {
+    throw "Release binaries missing under $binDir. Run .\build.ps1 -Architecture $Architecture first."
 }
-if (!(Test-Path -LiteralPath $executable)) { throw "Run build.ps1 first." }
-$cliExecutable = Join-Path $binaryDirectory "MemeStudio-cli.exe"
-if (!(Test-Path -LiteralPath $cliExecutable)) { throw "Run build.ps1 to build the console executable first." }
-$package = Join-Path $project "dist\MemeStudio"
-New-Item -ItemType Directory -Force -Path $package,(Join-Path $package "bin") | Out-Null
-foreach ($name in @("src", "tests", "vendor", "sdk")) {
-    Copy-Item -LiteralPath (Join-Path $project $name) -Destination $package -Recurse -Force
+
+$stageRoot = Join-Path $projectRoot "out\staging\$Architecture\MemeStudio"
+$pkgDir = Join-Path $projectRoot "out\packages"
+
+# Always wipe staging clean to prevent stale cross-arch or historical file leakage!
+if (Test-Path -LiteralPath $stageRoot) {
+    Remove-Item -LiteralPath $stageRoot -Recurse -Force
 }
-foreach ($name in @("README.md", "CLI.md", "PLUGINS.md", "VALIDATION.md", "THIRD_PARTY.md", "CMakeLists.txt", "build.ps1", "package.ps1", ".gitignore")) {
-    Copy-Item -LiteralPath (Join-Path $project $name) -Destination $package -Force
+New-Item -ItemType Directory -Path $stageRoot, "$stageRoot\plugins", "$stageRoot\sdk", "$stageRoot\docs", $pkgDir -Force | Out-Null
+
+# Strict binary & user-documentation whitelist (zero src/, tests/, or compiler intermediates!)
+Copy-Item -LiteralPath $guiExe -Destination "$stageRoot\MemeStudio.exe" -Force
+Copy-Item -LiteralPath $cliExe -Destination "$stageRoot\MemeStudio-cli.exe" -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot "sdk\memestudio_plugin.h") -Destination "$stageRoot\sdk\memestudio_plugin.h" -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot "sdk\memestudio_plugin_kit.hpp") -Destination "$stageRoot\sdk\memestudio_plugin_kit.hpp" -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination "$stageRoot\README.md" -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot "THIRD_PARTY.md") -Destination "$stageRoot\THIRD_PARTY.md" -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot "docs\CLI.md") -Destination "$stageRoot\docs\CLI.md" -Force
+Copy-Item -LiteralPath (Join-Path $projectRoot "docs\PLUGIN_SDK.md") -Destination "$stageRoot\docs\PLUGIN_SDK.md" -Force
+
+$zipOut = Join-Path $pkgDir "MemeStudio-Windows-$Architecture.zip"
+if (Test-Path -LiteralPath $zipOut) {
+    Remove-Item -LiteralPath $zipOut -Force
 }
-Copy-Item -LiteralPath $executable -Destination (Join-Path $package "bin\MemeStudio.exe") -Force
-Copy-Item -LiteralPath $cliExecutable -Destination (Join-Path $package "bin\MemeStudio-cli.exe") -Force
-foreach ($pluginName in @("example", "local-redraw", "waifu2x", "batch-convert", "prompt-draw", "api-parameter-test", "api-load-balancing", "qwen-image", "deepseek-harness")) {
-    $sourceOutput = Join-Path $package "plugins\$pluginName"
-    New-Item -ItemType Directory -Force -Path $sourceOutput | Out-Null
-    foreach ($name in @("plugin.cpp", "plugin.json")) {
-        Copy-Item -LiteralPath (Join-Path $project "plugins\$pluginName\$name") -Destination $sourceOutput -Force
-    }
-    $pluginOutput = Join-Path $package "bin\plugins\$pluginName"
-    New-Item -ItemType Directory -Force -Path $pluginOutput | Out-Null
-    foreach ($name in @("$pluginName.dll", "plugin.json")) {
-        Copy-Item -LiteralPath (Join-Path $binaryDirectory "plugins\$pluginName\$name") -Destination $pluginOutput -Force
-    }
-    if ($pluginName -eq "qwen-image") {
-        foreach ($file in @("server.py", "environment.py", "model_info.py", "sdcpp_backend.py", "requirements.txt", "README.md")) {
-            Copy-Item -LiteralPath (Join-Path $binaryDirectory "plugins\qwen-image\$file") -Destination $pluginOutput -Force
-            Copy-Item -LiteralPath (Join-Path $project "plugins\qwen-image\$file") -Destination $sourceOutput -Force
-        }
-    }
-    if ($pluginName -eq "deepseek-harness") {
-        foreach ($file in @("package.json", "cordis.patch.yml", "index.js", "icon.svg", "locale", "README.md")) {
-            Copy-Item -LiteralPath (Join-Path $binaryDirectory "plugins\deepseek-harness\$file") -Destination $pluginOutput -Recurse -Force
-            Copy-Item -LiteralPath (Join-Path $project "plugins\deepseek-harness\$file") -Destination $sourceOutput -Recurse -Force
-        }
-    }
+& tar.exe -a -c -f $zipOut -C (Split-Path -Parent $stageRoot) "MemeStudio"
+if ($LASTEXITCODE -ne 0) {
+    throw "Archive creation failed for $zipOut"
 }
-$archive = Join-Path $project "MemeStudio-Windows-$Architecture.zip"
-Compress-Archive -LiteralPath $package -DestinationPath $archive -Force
-Get-Item -LiteralPath $archive | Select-Object FullName,Length
-$pluginArchive = Join-Path $project "MemeStudio-Plugins-$Architecture.zip"
-Compress-Archive -LiteralPath (Join-Path $package "bin\plugins"),(Join-Path $package "PLUGINS.md") -DestinationPath $pluginArchive -Force
-Get-Item -LiteralPath $pluginArchive | Select-Object FullName,Length
+
+Write-Host "Package ready: $zipOut"
