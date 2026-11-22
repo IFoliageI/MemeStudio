@@ -275,7 +275,7 @@ void openPluginManagerDialog(
         kPluginDlgClass,
         L"插件管理",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, cw, ch,
+        0, 0, cw, ch,
         owner, nullptr, instance, st);
     if (!win) {
         delete st;

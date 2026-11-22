@@ -19,7 +19,7 @@ void ensurePanelClassRegistered(HINSTANCE instance, WNDPROC proc) {
     wc.lpfnWndProc = proc;
     wc.hInstance = instance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     wc.lpszClassName = kPanelClassName;
     RegisterClassExW(&wc);
 }
@@ -127,12 +127,19 @@ int32_t PanelManager::openOrActivatePluginPanel(
     openPanels_.push_back(entry);
     std::wstring wTitle = base::utf8ToWideLossy(titleUtf8);
 
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+    DWORD exStyle = WS_EX_DLGMODALFRAME;
+    RECT adjusted{0, 0, clientW, clientH};
+    AdjustWindowRectExForDpi(&adjusted, style, FALSE, exStyle, dpi);
+    int initialWinW = adjusted.right - adjusted.left;
+    int initialWinH = adjusted.bottom - adjusted.top;
+
     HWND created = CreateWindowExW(
-        WS_EX_DLGMODALFRAME,
+        exStyle,
         kPanelClassName,
         wTitle.c_str(),
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-        CW_USEDEFAULT, CW_USEDEFAULT, clientW, clientH,
+        style,
+        0, 0, initialWinW, initialWinH,
         owner, nullptr, instance_, entry.get());
 
     if (!created) {
