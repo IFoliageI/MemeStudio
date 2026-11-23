@@ -1,6 +1,6 @@
 # MemeStudio 插件 SDK 规范 (`MemeStudioPluginABI v2`)
 
-`MemeStudio` 采用微内核插件架构：宿主核心不包含任何特定插件的业务逻辑或硬编码插件 ID，所有扩展能力均通过 `sdk/memestudio_plugin.h`（C ABI v2）动态装载。官方示例脚手架与全部 8 个独立功能插件位于独立仓库 **`MemeConvertStudio`**。
+`MemeStudio` 采用微内核插件架构：宿主核心不包含任何特定插件的业务逻辑或硬编码插件 ID，所有扩展能力均通过 `sdk/memestudio_plugin.h`（C ABI v2）动态装载。官方示例脚手架与全部 8 个独立功能插件位于独立仓库 **`MemeStudioPlugins`**。
 
 ## 1. 插件目录与清单 (`plugin.json`)
 

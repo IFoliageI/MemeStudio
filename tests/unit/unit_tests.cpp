@@ -258,16 +258,22 @@ void testRealPluginHostLoadsExternalDll(const std::filesystem::path& sandbox) {
     using namespace meme;
     base::setAppDataRootOverride(sandbox / L"appdata_plugin_host");
 
-    std::filesystem::path externalPluginsRoot =
-        "D:/Projects/MemeStudioDev/MemeConvertStudio/out/build/x64/dist/Release/plugins";
+    std::filesystem::path externalPluginsRoot = base::defaultPluginsDir();
+    if (!std::filesystem::exists(externalPluginsRoot / L"example" / L"example.dll")) {
+        externalPluginsRoot =
+            base::executableFilePath().parent_path().parent_path().parent_path().parent_path().parent_path() /
+            L"MemeStudioPlugins" / L"out" / L"dist" / L"x64" / L"plugins";
+    }
     if (!std::filesystem::exists(externalPluginsRoot / L"example" / L"example.dll")) {
         return;
     }
 
     auto discovered = core::discoverPluginsInDirectory(externalPluginsRoot);
     EXPECT(!discovered.empty());
-    EXPECT(discovered[0].id == "memestudio.example");
-    EXPECT(discovered[0].loadError.empty());
+    bool foundExample = std::any_of(discovered.begin(), discovered.end(), [](const core::PluginManifest& m) {
+        return m.id == "memestudio.example" && m.loadError.empty();
+    });
+    EXPECT(foundExample);
 
     net::WinHttpPool pool;
     net::CancelToken cancel;

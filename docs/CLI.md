@@ -36,7 +36,7 @@ MemeStudio-cli models --base-url https://api.openai.com/v1
 ```
 
 ### 4. 调用独立插件命令 (`plugin-cmd`)
-通过无头方式直接驱动 `MemeConvertStudio` 中的任意独立插件命令（如批量队列、参数探测、渠道对比等）：
+通过无头方式直接驱动 `MemeStudioPlugins` 中的任意独立插件命令（如批量队列、参数探测、渠道对比等）：
 ```powershell
 MemeStudio-cli plugin-cmd --plugin memestudio.api-parameter-test --command plan --args "{}"
 ```

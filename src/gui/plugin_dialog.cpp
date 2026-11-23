@@ -78,7 +78,7 @@ struct PluginMgrState {
         int idx = selectedPluginIndex();
         if (idx < 0 || static_cast<size_t>(idx) >= plugins.size()) {
             uikit::setTextUtf8(descBox, plugins.empty()
-                ? "当前 plugins/ 目录未发现已安装的插件包。可将 MemeConvertStudio 编译产物解压至 plugins/ 目录。"
+                ? "当前 plugins/ 目录未发现已安装的插件包。可将 MemeStudioPlugins 编译产物解压至 plugins/ 目录。"
                 : "请选择上方插件查看详情与可用命令。");
             EnableWindow(cmdCombo, FALSE);
             EnableWindow(btnRun, FALSE);
