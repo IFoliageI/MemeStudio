@@ -1,4 +1,5 @@
 #include "uikit/image_canvas.hpp"
+#include "media/image_ops.hpp"
 #include "base/utf8.hpp"
 #include <shellapi.h>
 #include <windowsx.h>
@@ -96,6 +97,7 @@ struct ImageCanvas::Impl {
 
     std::function<void(const media::NormalizedRect&)> onCropChanged;
     std::function<void(const fs::path&)> onFileDropped;
+    std::function<void(const std::vector<fs::path>&)> onFilesDropped;
 
     ~Impl() {
         releaseCachedBitmap();
@@ -326,14 +328,23 @@ struct ImageCanvas::Impl {
             case WM_DROPFILES: {
                 HDROP drop = reinterpret_cast<HDROP>(wp);
                 UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-                if (count > 0 && self->onFileDropped) {
-                    UINT len = DragQueryFileW(drop, 0, nullptr, 0);
+                std::vector<fs::path> dropped;
+                dropped.reserve(count);
+                for (UINT i = 0; i < count; ++i) {
+                    UINT len = DragQueryFileW(drop, i, nullptr, 0);
                     std::wstring buf(len + 1, L'\0');
-                    DragQueryFileW(drop, 0, buf.data(), len + 1);
+                    DragQueryFileW(drop, i, buf.data(), len + 1);
                     buf.resize(len);
-                    self->onFileDropped(fs::path(buf));
+                    dropped.emplace_back(std::move(buf));
                 }
                 DragFinish(drop);
+                if (!dropped.empty()) {
+                    if (self->onFilesDropped) {
+                        self->onFilesDropped(dropped);
+                    } else if (self->onFileDropped) {
+                        self->onFileDropped(dropped.front());
+                    }
+                }
                 return 0;
             }
         }
@@ -388,17 +399,8 @@ void ImageCanvas::setImage(const media::Image* image) {
         return;
     }
 
-    // One-time pre-multiplied alpha conversion into cached DIBSection!
-    const uint8_t* src = image->pixels.data();
-    auto* dst = static_cast<uint8_t*>(dstBits);
-    size_t pixelCount = static_cast<size_t>(image->width) * image->height;
-    for (size_t i = 0; i < pixelCount; ++i) {
-        uint32_t a = src[i * 4 + 3];
-        dst[i * 4 + 0] = static_cast<uint8_t>((src[i * 4 + 0] * a + 127) / 255);
-        dst[i * 4 + 1] = static_cast<uint8_t>((src[i * 4 + 1] * a + 127) / 255);
-        dst[i * 4 + 2] = static_cast<uint8_t>((src[i * 4 + 2] * a + 127) / 255);
-        dst[i * 4 + 3] = static_cast<uint8_t>(a);
-    }
+    // Delegate BGRA -> PARGB32 conversion directly to backend media layer!
+    media::premultiplyBgraToPargb32(*image, static_cast<uint8_t*>(dstBits), static_cast<size_t>(image->width) * 4);
 
     impl_->cachedBitmap = dib;
     impl_->imgWidth = image->width;
@@ -432,6 +434,10 @@ void ImageCanvas::setOnCropChanged(std::function<void(const media::NormalizedRec
 
 void ImageCanvas::setOnFileDropped(std::function<void(const fs::path&)> cb) {
     impl_->onFileDropped = std::move(cb);
+}
+
+void ImageCanvas::setOnFilesDropped(std::function<void(const std::vector<fs::path>&)> cb) {
+    impl_->onFilesDropped = std::move(cb);
 }
 
 void ImageCanvas::notifyDpiChanged(UINT newDpi) noexcept {

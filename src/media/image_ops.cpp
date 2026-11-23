@@ -152,4 +152,23 @@ Image preserveRegionOutside(const Image& original, const Image& edited, const No
     return out;
 }
 
+void premultiplyBgraToPargb32(const Image& src, uint8_t* dstBuffer, size_t dstStrideBytes) noexcept {
+    if (src.empty() || !dstBuffer || dstStrideBytes < static_cast<size_t>(src.width) * 4) {
+        return;
+    }
+    const uint8_t* sBase = src.pixels.data();
+    size_t sStride = src.stride();
+    for (uint32_t y = 0; y < src.height; ++y) {
+        const uint8_t* sRow = sBase + static_cast<size_t>(y) * sStride;
+        uint8_t* dRow = dstBuffer + static_cast<size_t>(y) * dstStrideBytes;
+        for (uint32_t x = 0; x < src.width; ++x) {
+            uint32_t a = sRow[x * 4 + 3];
+            dRow[x * 4 + 0] = static_cast<uint8_t>((sRow[x * 4 + 0] * a + 127) / 255);
+            dRow[x * 4 + 1] = static_cast<uint8_t>((sRow[x * 4 + 1] * a + 127) / 255);
+            dRow[x * 4 + 2] = static_cast<uint8_t>((sRow[x * 4 + 2] * a + 127) / 255);
+            dRow[x * 4 + 3] = static_cast<uint8_t>(a);
+        }
+    }
+}
+
 } // namespace meme::media

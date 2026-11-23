@@ -15,6 +15,7 @@
 #include "net/openai_client.hpp"
 #include "net/redactor.hpp"
 #include "net/winhttp_pool.hpp"
+#include "memestudio_engine.h"
 
 #include <windows.h>
 #include <objbase.h>
@@ -290,6 +291,67 @@ void testRealPluginHostLoadsExternalDll(const std::filesystem::path& sandbox) {
     EXPECT(statusJson.value("enabled", false) == true);
 }
 
+void testEngineCAbiAndMultiSourceNavigation(const std::filesystem::path& sandbox) {
+    using namespace meme;
+    base::setAppDataRootOverride(sandbox / L"appdata_engine_cabi");
+
+    auto srcDir = sandbox / L"multi_sources";
+    std::filesystem::create_directories(srcDir);
+
+    // Create 3 semi-transparent images with distinct colors to verify PARGB32 premultiplied readout & index switching
+    auto makeTranslucentImg = [](uint8_t b, uint8_t g, uint8_t r, uint8_t a) {
+        media::Image img{4, 4, base::Bytes(4 * 4 * 4)};
+        for (size_t i = 0; i < 16; ++i) {
+            img.pixels[i * 4 + 0] = b;
+            img.pixels[i * 4 + 1] = g;
+            img.pixels[i * 4 + 2] = r;
+            img.pixels[i * 4 + 3] = a;
+        }
+        return img;
+    };
+    media::savePngFile(srcDir / L"01_blue.png",  makeTranslucentImg(200, 0, 0, 128));
+    media::savePngFile(srcDir / L"02_green.png", makeTranslucentImg(0, 200, 0, 128));
+    media::savePngFile(srcDir / L"03_red.png",   makeTranslucentImg(0, 0, 200, 255));
+
+    MemeEngineSession* session = nullptr;
+    MemeEngineBuffer err{};
+    EXPECT(meme_session_create(nullptr, nullptr, &session, &err) == 0);
+    EXPECT(session != nullptr);
+    meme_engine_free_buffer(&err);
+
+    // Import folder -> 3 sources queued, index = 0
+    MemeEngineBuffer summaryBuf{};
+    std::string pathsJson = nlohmann::json::array({base::wideToUtf8(srcDir.wstring())}).dump();
+    EXPECT(meme_session_import_sources(session, pathsJson.c_str(), 0, &summaryBuf, &err) == 0);
+    auto summary = nlohmann::json::parse(std::string(reinterpret_cast<char*>(summaryBuf.data), summaryBuf.size));
+    meme_engine_free_buffer(&summaryBuf);
+    EXPECT(summary.at("count") == 3);
+    EXPECT(summary.at("current_index") == 0);
+
+    // Test direct jump (<- [ 3 ] / 3 -> -> 0-based index 2)
+    EXPECT(meme_session_select_source_index(session, 2, &summaryBuf, &err) == 0);
+    summary = nlohmann::json::parse(std::string(reinterpret_cast<char*>(summaryBuf.data), summaryBuf.size));
+    meme_engine_free_buffer(&summaryBuf);
+    EXPECT(summary.at("current_index") == 2);
+
+    // Test step wrap-around (+1 from index 2 wraps to index 0!)
+    EXPECT(meme_session_step_source_index(session, +1, &summaryBuf, &err) == 0);
+    summary = nlohmann::json::parse(std::string(reinterpret_cast<char*>(summaryBuf.data), summaryBuf.size));
+    meme_engine_free_buffer(&summaryBuf);
+    EXPECT(summary.at("current_index") == 0);
+
+    // Read premultiplied PARGB32 frame for index 0 (B=200, A=128 -> B_premul = (200*128+127)/255 = 100)
+    uint32_t fw = 0, fh = 0, delay = 0;
+    size_t fcount = 0;
+    std::vector<uint8_t> pargb(4 * 4 * 4);
+    EXPECT(meme_session_read_frame_pargb32(
+        session, MEME_FRAME_SOURCE, 0, &fw, &fh, &delay, &fcount, pargb.data(), 4 * 4, &err) == 0);
+    EXPECT(fw == 4 && fh == 4 && fcount == 1);
+    EXPECT(pargb[0] == 100 && pargb[1] == 0 && pargb[2] == 0 && pargb[3] == 128);
+
+    meme_session_destroy(session);
+}
+
 } // namespace
 
 int wmain() {
@@ -312,6 +374,7 @@ int wmain() {
         testNetEndpointsRedactorAndSse();
         testConfigMigrationIniAndFrameSchedule(sandbox);
         testRealPluginHostLoadsExternalDll(sandbox);
+        testEngineCAbiAndMultiSourceNavigation(sandbox);
     } catch (const std::exception& e) {
         std::cerr << "[UNCAUGHT EXCEPTION] " << e.what() << "\n";
         ++g_failed;

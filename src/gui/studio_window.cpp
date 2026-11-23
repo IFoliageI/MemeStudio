@@ -1,30 +1,23 @@
 #include "gui/studio_window.hpp"
 #include "gui/plugin_dialog.hpp"
 #include "gui/presets_dialog.hpp"
-#include "core/config_store.hpp"
-#include "core/plugin_host.hpp"
-#include "core/replace_engine.hpp"
-#include "media/wic_codec.hpp"
+#include "core/studio_session.hpp"
 #include "uikit/controls.hpp"
 #include "uikit/dpi.hpp"
 #include "uikit/file_dialogs.hpp"
 #include "uikit/image_canvas.hpp"
 #include "uikit/panel_manager.hpp"
-#include "base/app_paths.hpp"
-#include "base/crypto.hpp"
 #include "base/error.hpp"
-#include "base/fs_io.hpp"
 #include "base/utf8.hpp"
 
 #include <commctrl.h>
-#include <objbase.h>
 #include <shellapi.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <charconv>
 #include <deque>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <vector>
 
 namespace meme::gui {
@@ -32,29 +25,35 @@ namespace meme::gui {
 namespace {
 
 constexpr const wchar_t* kMainClass = L"MemeStudioMainWindowV2";
-constexpr UINT WM_WORKER_EVENT = WM_APP + 10;
+constexpr UINT WM_SESSION_EVENT = WM_APP + 10;
 constexpr UINT_PTR kAnimTimerId = 1;
 
 enum MainControlId : int {
-    IdPickSource        = 1001,
-    IdPickCharacter     = 1002,
-    IdResetCrop         = 1003,
-    IdAddStyle          = 1004,
-    IdRemoveStyle       = 1005,
-    IdStyleList         = 1006,
-    IdOpenPresets       = 1007,
-    IdInstructionEdit   = 1008,
+    IdPickSourceFiles    = 1001,
+    IdPickSourceFolder   = 1002,
+    IdPrevSourceBtn      = 1003,
+    IdSourceIndexEdit    = 1004,
+    IdNextSourceBtn      = 1005,
+    IdJumpSourceCommit   = 1006,
 
-    IdViewModeCombo     = 1020,
-    IdCopySelectCombo   = 1021,
-    IdOpenOutputBtn     = 1022,
-    IdOpenFolderBtn     = 1023,
-    IdPlayPauseBtn      = 1024,
-    IdFrameScrubber     = 1025,
-    IdOutputEdit        = 1026,
-    IdBrowseOutput      = 1027,
-    IdStartGenerate     = 1028,
-    IdCancelGenerate    = 1029,
+    IdPickCharacter      = 1010,
+    IdResetCrop          = 1011,
+    IdAddStyle           = 1012,
+    IdRemoveStyle        = 1013,
+    IdStyleList          = 1014,
+    IdOpenPresets        = 1015,
+    IdInstructionEdit    = 1016,
+
+    IdViewModeCombo      = 1020,
+    IdCopySelectCombo    = 1021,
+    IdOpenOutputBtn      = 1022,
+    IdOpenFolderBtn      = 1023,
+    IdPlayPauseBtn       = 1024,
+    IdFrameScrubber      = 1025,
+    IdOutputEdit         = 1026,
+    IdBrowseOutput       = 1027,
+    IdStartGenerate      = 1028,
+    IdCancelGenerate     = 1029,
 
     IdDisconnectOverride = 1040,
     IdBaseUrlEdit        = 1041,
@@ -74,22 +73,7 @@ enum MainControlId : int {
     IdResumeCheck        = 1055,
     IdManagePluginsBtn   = 1060,
 
-    // Dynamic toolbar command buttons added by loaded plugins (zero hardcoded plugin IDs!)
     IdPluginToolbarBase  = 1500
-};
-
-struct WorkerEvent {
-    enum class Kind {
-        Progress,
-        JobSucceeded,
-        JobFailed,
-        ModelsFetched
-    } kind = Kind::Progress;
-
-    core::ReplaceProgress progress;
-    std::vector<std::filesystem::path> outputs;
-    std::vector<std::string> models;
-    std::string errorMessage;
 };
 
 struct DynamicToolbarAction {
@@ -99,52 +83,48 @@ struct DynamicToolbarAction {
     HWND button = nullptr;
 };
 
+// Pure thin Win32 View driving the UI-independent core::StudioSession backend!
 struct StudioAppWindow {
     HINSTANCE instance = nullptr;
     HWND hwnd = nullptr;
     uikit::DpiContext dpi;
     uikit::PanelManager panels;
-    net::WinHttpPool httpPool;
+    std::unique_ptr<core::StudioSession> session;
 
-    core::StudioSettings settings;
-    std::vector<core::PluginManifest> discoveredPlugins;
-    std::unique_ptr<core::PluginHost> pluginHost;
-    std::optional<core::SessionEndpointOverride> activeOverride;
     std::vector<DynamicToolbarAction> toolbarActions;
 
-    // Canvases & media state
+    // Canvases & cached active animation copy for 60fps UI timer playback
     uikit::ImageCanvas sourceCanvas;
     uikit::ImageCanvas characterCanvas;
     uikit::ImageCanvas mainCanvas;
 
-    std::filesystem::path sourcePath;
-    std::filesystem::path characterPath;
-    std::vector<std::filesystem::path> stylePaths;
-    std::vector<std::filesystem::path> resultPaths;
-
-    media::Animation sourceAnim;
-    media::Image characterImage;
-    media::Animation resultAnim;
+    media::Animation cachedSourceAnim;
+    media::Image cachedCharacterImg;
+    media::Animation cachedResultAnim;
 
     bool showingResultView = false;
     bool playingAnim = false;
     size_t currentFrameIdx = 0;
+    bool updatingSourceNavControls = false;
 
     // Controls
     HWND headerTitle = nullptr;
     HWND managePluginsBtn = nullptr;
 
-    HWND lblSource = nullptr, pickSourceBtn = nullptr;
+    // Left column (Source + <- [1]/N -> switcher + Character + Styles + Instruction)
+    HWND lblSource = nullptr, pickSourceFilesBtn = nullptr, pickSourceDirBtn = nullptr;
+    HWND prevSourceBtn = nullptr, sourceIndexEdit = nullptr, lblSourceSlashTotal = nullptr, nextSourceBtn = nullptr;
     HWND lblCharacter = nullptr, pickCharBtn = nullptr, resetCropBtn = nullptr;
     HWND lblStyles = nullptr, addStyleBtn = nullptr, removeStyleBtn = nullptr, styleList = nullptr;
     HWND lblInstruction = nullptr, presetsBtn = nullptr, instructionEdit = nullptr;
 
+    // Center column
     HWND viewModeCombo = nullptr, copyCombo = nullptr, openOutBtn = nullptr, openDirBtn = nullptr;
     HWND playBtn = nullptr, scrubber = nullptr, frameInfoLabel = nullptr;
     HWND lblOutput = nullptr, outputEdit = nullptr, browseOutBtn = nullptr;
     HWND progressBar = nullptr, statusLabel = nullptr, startBtn = nullptr, cancelBtn = nullptr;
 
-    // Right pane controls
+    // Right column
     HWND overrideBannerLabel = nullptr, disconnectOverrideBtn = nullptr;
     HWND lblBaseUrl = nullptr, baseUrlEdit = nullptr;
     HWND lblKey = nullptr, keyEdit = nullptr, rememberCheck = nullptr;
@@ -156,12 +136,8 @@ struct StudioAppWindow {
     HWND consistencyCheck = nullptr, preserveTextCheck = nullptr, resumeCheck = nullptr;
     HWND activeFiltersLabel = nullptr, logEdit = nullptr;
 
-    // Thread-safe event queue (zero raw pointer PostMessageW leaks!)
     std::mutex eventMutex;
-    std::deque<WorkerEvent> pendingEvents;
-    net::CancelToken cancelToken;
-    std::thread workerThread;
-    bool workerBusy = false;
+    std::deque<core::SessionEvent> pendingEvents;
     bool closeAfterCancel = false;
 
     explicit StudioAppWindow(HINSTANCE inst)
@@ -169,29 +145,23 @@ struct StudioAppWindow {
 
     ~StudioAppWindow() {
         stopPlaybackTimer();
-        cancelToken.stop();
-        if (workerThread.joinable()) {
-            workerThread.join();
-        }
-        pluginHost.reset();
+        session.reset();
     }
 
-    void pushWorkerEvent(WorkerEvent ev) {
+    void enqueueSessionEvent(core::SessionEvent ev) {
         {
             std::lock_guard lock(eventMutex);
             pendingEvents.push_back(std::move(ev));
         }
         if (hwnd && IsWindow(hwnd)) {
-            PostMessageW(hwnd, WM_WORKER_EVENT, 0, 0);
+            PostMessageW(hwnd, WM_SESSION_EVENT, 0, 0);
         }
     }
 
     void appendLog(std::string_view lineUtf8) {
         if (!logEdit) return;
         std::string cur = uikit::getTextUtf8(logEdit);
-        if (cur.size() > 16000) {
-            cur.erase(0, cur.size() - 12000);
-        }
+        if (cur.size() > 16000) cur.erase(0, cur.size() - 12000);
         if (!cur.empty()) cur += "\r\n";
         cur += lineUtf8;
         uikit::setTextUtf8(logEdit, cur);
@@ -200,7 +170,7 @@ struct StudioAppWindow {
     }
 
     const media::Animation& activeMainAnimation() const noexcept {
-        return (showingResultView && !resultAnim.frames.empty()) ? resultAnim : sourceAnim;
+        return (showingResultView && !cachedResultAnim.frames.empty()) ? cachedResultAnim : cachedSourceAnim;
     }
 
     void stopPlaybackTimer() noexcept {
@@ -247,101 +217,145 @@ struct StudioAppWindow {
         EnableWindow(scrubber, anim.animated ? TRUE : FALSE);
     }
 
-    void loadSourceFile(const std::filesystem::path& path) {
-        try {
-            media::Animation decoded = media::decodeAnimation(path);
-            sourcePath = path;
-            sourceAnim = std::move(decoded);
-            sourceCanvas.setImage(&sourceAnim.frames.front().image);
-            showingResultView = false;
-            SendMessageW(viewModeCombo, CB_SETCURSEL, 0, 0);
+    // Updates <- [ 1 ] / N -> bar, source preview canvas, main preview canvas, and output label!
+    void refreshSourceNavigationAndPreview(bool updateSuggestedOutput) {
+        if (!session) return;
+        size_t total = session->sourceCount();
+        size_t curZeroIdx = session->currentSourceIndex();
+        auto curEntry = session->currentSourceEntry();
+
+        updatingSourceNavControls = true;
+        if (total == 0) {
+            uikit::setTextUtf8(lblSource, "源表情素材");
+            uikit::setTextUtf8(sourceIndexEdit, "0");
+            uikit::setTextUtf8(lblSourceSlashTotal, "/ 0");
+            EnableWindow(prevSourceBtn, FALSE);
+            EnableWindow(sourceIndexEdit, FALSE);
+            EnableWindow(nextSourceBtn, FALSE);
+            cachedSourceAnim = {};
+            sourceCanvas.clearImage();
+        } else {
+            std::string fn = curEntry ? base::wideToUtf8(curEntry->path.filename().wstring()) : "";
+            uikit::setTextUtf8(lblSource, "源表情 (" + fn + ")");
+            uikit::setTextUtf8(sourceIndexEdit, std::to_string(curZeroIdx + 1));
+            uikit::setTextUtf8(lblSourceSlashTotal, "/ " + std::to_string(total));
+            bool multi = (total > 1);
+            EnableWindow(prevSourceBtn, multi ? TRUE : FALSE);
+            EnableWindow(sourceIndexEdit, multi ? TRUE : FALSE);
+            EnableWindow(nextSourceBtn, multi ? TRUE : FALSE);
+
+            cachedSourceAnim = session->currentSourceAnimationSnapshot();
+            if (!cachedSourceAnim.frames.empty()) {
+                sourceCanvas.setImage(&cachedSourceAnim.frames.front().image);
+            } else {
+                sourceCanvas.clearImage();
+            }
+        }
+        updatingSourceNavControls = false;
+
+        uikit::setTextUtf8(lblOutput, total > 1 ? "输出目录" : "保存路径");
+        if (updateSuggestedOutput && total > 0) {
+            uikit::setTextUtf8(outputEdit, base::wideToUtf8(session->suggestedOutputTarget().wstring()));
+        }
+
+        if (!showingResultView) {
             currentFrameIdx = 0;
             updateMainPreviewFrame();
-            if (sourceAnim.animated) scheduleNextFrameTimer();
+            if (cachedSourceAnim.animated) scheduleNextFrameTimer();
             else stopPlaybackTimer();
+        }
+    }
 
-            // Suggest default non-colliding output path
-            std::filesystem::path suggested = path.parent_path() /
-                (path.stem().wstring() + L"-edited" + (sourceAnim.animated ? L".gif" : L".png"));
-            uikit::setTextUtf8(outputEdit, base::wideToUtf8(suggested.wstring()));
-            appendLog("已载入源表情：" + base::wideToUtf8(path.filename().wstring()));
+    void importSourcePathsFromUi(const std::vector<std::filesystem::path>& paths, bool append = false) {
+        if (paths.empty() || !session) return;
+        try {
+            size_t imported = session->importSources(paths, append);
+            showingResultView = false;
+            SendMessageW(viewModeCombo, CB_SETCURSEL, 0, 0);
+            refreshSourceNavigationAndPreview(true);
+            appendLog("已载入源表情队列：新增 " + std::to_string(imported) +
+                      " 项（当前共 " + std::to_string(session->sourceCount()) + " 项）");
         } catch (const std::exception& e) {
             uikit::showErrorBox(hwnd, "载入源表情失败", e.what());
         }
     }
 
-    void loadCharacterFile(const std::filesystem::path& path) {
+    void commitJumpSourceIndexFromEdit() {
+        if (!session || updatingSourceNavControls) return;
+        size_t total = session->sourceCount();
+        if (total == 0) return;
+
+        std::string raw = base::trimAscii(uikit::getTextUtf8(sourceIndexEdit));
+        int parsedOneBased = 0;
+        auto [ptr, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), parsedOneBased);
+        if (ec != std::errc{} || ptr != raw.data() + raw.size()) {
+            // Restore valid current index display
+            updatingSourceNavControls = true;
+            uikit::setTextUtf8(sourceIndexEdit, std::to_string(session->currentSourceIndex() + 1));
+            updatingSourceNavControls = false;
+            return;
+        }
+        int clampedOneBased = std::clamp<int>(parsedOneBased, 1, static_cast<int>(total));
         try {
-            characterImage = media::decodeFirstFrame(path);
-            characterPath = path;
+            session->selectSourceIndex(static_cast<size_t>(clampedOneBased - 1));
+            showingResultView = false;
+            SendMessageW(viewModeCombo, CB_SETCURSEL, 0, 0);
+            refreshSourceNavigationAndPreview(total == 1);
+        } catch (const std::exception& e) {
+            uikit::showErrorBox(hwnd, "切换预览图片失败", e.what());
+        }
+    }
+
+    void loadCharacterFromUi(const std::filesystem::path& path) {
+        if (!session) return;
+        try {
+            session->loadCharacterFile(path);
+            cachedCharacterImg = session->characterImageSnapshot();
             characterCanvas.setCropRect({0.0, 0.0, 1.0, 1.0});
-            characterCanvas.setImage(&characterImage);
+            characterCanvas.setImage(&cachedCharacterImg);
             appendLog("已载入人物参考图：" + base::wideToUtf8(path.filename().wstring()));
         } catch (const std::exception& e) {
             uikit::showErrorBox(hwnd, "载入人物参考图失败", e.what());
         }
     }
 
-    void loadResultFile(const std::filesystem::path& path) {
-        try {
-            resultAnim = media::decodeAnimation(path);
-            showingResultView = true;
-            SendMessageW(viewModeCombo, CB_SETCURSEL, 1, 0);
-            currentFrameIdx = 0;
-            updateMainPreviewFrame();
-            if (resultAnim.animated) scheduleNextFrameTimer();
-            else stopPlaybackTimer();
-        } catch (const std::exception& e) {
-            appendLog(std::string("预览结果失败：") + e.what());
+    void syncControlsIntoSession(bool persist) {
+        if (!session) return;
+        auto st = session->settingsSnapshot();
+        if (!session->activeEndpointOverride().has_value()) {
+            st.provider.baseUrl = base::trimAscii(uikit::getTextUtf8(baseUrlEdit));
+            st.provider.apiKey  = base::trimAscii(uikit::getTextUtf8(keyEdit));
         }
-    }
-
-    void syncSettingsFromControls() {
-        // Never overwrite saved commercial BaseUrl/Key when a non-destructive session override is active!
-        if (!activeOverride.has_value()) {
-            settings.provider.baseUrl = base::trimAscii(uikit::getTextUtf8(baseUrlEdit));
-            settings.provider.apiKey = base::trimAscii(uikit::getTextUtf8(keyEdit));
-        }
-        settings.rememberKey = uikit::isChecked(rememberCheck);
-        settings.provider.model = base::trimAscii(uikit::getTextUtf8(modelCombo));
-        settings.provider.quality = uikit::getTextUtf8(qualityCombo);
-        settings.provider.size = uikit::getTextUtf8(sizeCombo);
+        st.rememberKey = uikit::isChecked(rememberCheck);
+        st.provider.model = base::trimAscii(uikit::getTextUtf8(modelCombo));
+        st.provider.quality = uikit::getTextUtf8(qualityCombo);
+        st.provider.size = uikit::getTextUtf8(sizeCombo);
         std::string fmt = uikit::getTextUtf8(formatCombo);
-        settings.provider.outputFormat = (fmt == "默认 (不传参)") ? "" : fmt;
-        settings.provider.stream = uikit::isChecked(streamCheck);
-        settings.copyCount = uikit::parseBoundedInt(copyCountEdit, "生成份数", 1, 10);
-        settings.frameStride = uikit::parseBoundedInt(strideEdit, "抽帧步长", 1, 600);
-        settings.maxFrames = uikit::parseBoundedInt(maxFramesEdit, "最大帧数", 0, 600);
-        settings.temporalConsistency = uikit::isChecked(consistencyCheck);
-        settings.preserveText = uikit::isChecked(preserveTextCheck);
-        settings.allowResume = uikit::isChecked(resumeCheck);
-    }
+        st.provider.outputFormat = (fmt == "默认 (不传参)") ? "" : fmt;
+        st.provider.stream = uikit::isChecked(streamCheck);
+        st.copyCount = uikit::parseBoundedInt(copyCountEdit, "生成份数", 1, 10);
+        st.frameStride = uikit::parseBoundedInt(strideEdit, "抽帧步长", 1, 600);
+        st.maxFrames = uikit::parseBoundedInt(maxFramesEdit, "最大帧数", 0, 600);
+        st.temporalConsistency = uikit::isChecked(consistencyCheck);
+        st.preserveText = uikit::isChecked(preserveTextCheck);
+        st.allowResume = uikit::isChecked(resumeCheck);
 
-    net::ProviderConfig effectiveRuntimeProvider() {
-        syncSettingsFromControls();
-        net::ProviderConfig prov = settings.provider;
-        if (activeOverride.has_value()) {
-            prov.baseUrl = activeOverride->baseUrl;
-            if (!activeOverride->apiKey.empty()) prov.apiKey = activeOverride->apiKey;
-            if (!activeOverride->model.empty() && prov.model.empty()) prov.model = activeOverride->model;
-        }
-        if (prov.apiKey.empty()) {
-            auto envKey = base::readEnvSecret("OPENAI_API_KEY");
-            prov.apiKey.assign(envKey.view());
-        }
-        return prov;
+        session->setCharacterCrop(characterCanvas.cropRect());
+        session->setInstruction(uikit::getTextUtf8(instructionEdit));
+        session->updateSettings(st, persist);
     }
 
     void refreshEndpointOverrideUi() {
-        bool overridden = activeOverride.has_value();
+        auto ov = session ? session->activeEndpointOverride() : std::nullopt;
+        bool overridden = ov.has_value();
+        bool busy = session && session->isBusy();
         if (overridden) {
-            std::string banner = "⚡ 当前会话连接已由插件「" + activeOverride->pluginId + "」接管";
-            uikit::setTextUtf8(overrideBannerLabel, banner);
+            uikit::setTextUtf8(overrideBannerLabel, "⚡ 当前会话连接已由插件「" + ov->pluginId + "」接管");
         }
         ShowWindow(overrideBannerLabel, overridden ? SW_SHOW : SW_HIDE);
         ShowWindow(disconnectOverrideBtn, overridden ? SW_SHOW : SW_HIDE);
-        EnableWindow(baseUrlEdit, (!overridden && !workerBusy) ? TRUE : FALSE);
-        EnableWindow(keyEdit, (!overridden && !workerBusy) ? TRUE : FALSE);
+        EnableWindow(baseUrlEdit, (!overridden && !busy) ? TRUE : FALSE);
+        EnableWindow(keyEdit, (!overridden && !busy) ? TRUE : FALSE);
         relayout();
     }
 
@@ -352,8 +366,8 @@ struct StudioAppWindow {
         toolbarActions.clear();
 
         std::string filterSummary = "已挂载管线滤镜：无";
-        if (pluginHost) {
-            auto fp = pluginHost->pipelineFingerprint();
+        if (session) {
+            auto fp = session->activePipelineFiltersJson();
             if (!fp.empty()) {
                 filterSummary = "已启用管线滤镜：";
                 for (size_t i = 0; i < fp.size(); ++i) {
@@ -363,8 +377,8 @@ struct StudioAppWindow {
             }
 
             int nextId = IdPluginToolbarBase;
-            for (const auto& m : discoveredPlugins) {
-                if (!pluginHost->isLoaded(m.id)) continue;
+            for (const auto& m : session->discoverAndListPlugins()) {
+                if (!session->isPluginLoaded(m.id)) continue;
                 for (const auto& cmd : m.commands) {
                     if (!cmd.showInToolbar) continue;
                     std::wstring wtitle = base::utf8ToWideLossy(cmd.title);
@@ -379,81 +393,11 @@ struct StudioAppWindow {
                 }
             }
         }
-        if (activeFiltersLabel) {
-            uikit::setTextUtf8(activeFiltersLabel, filterSummary);
-        }
+        if (activeFiltersLabel) uikit::setTextUtf8(activeFiltersLabel, filterSummary);
         relayout();
     }
 
-    bool reloadPlugins(
-        const std::vector<std::string>& enabledIds,
-        core::SignaturePolicy sigPolicy,
-        std::string& outErr) {
-        try {
-            discoveredPlugins = core::discoverPluginsInDirectory(base::defaultPluginsDir());
-
-            core::HostUiCallbacks cbs;
-            cbs.onLog = [this](int, std::string_view pid, std::string_view msg) {
-                appendLog("[" + std::string(pid) + "] " + std::string(msg));
-            };
-            cbs.onGetWorkspaceState = [this]() -> nlohmann::json {
-                nlohmann::json st{
-                    {"source_path", sourcePath.empty() ? "" : base::wideToUtf8(sourcePath.wstring())},
-                    {"character_path", characterPath.empty() ? "" : base::wideToUtf8(characterPath.wstring())},
-                    {"result_path", resultPaths.empty() ? "" : base::wideToUtf8(resultPaths.front().wstring())},
-                    {"instruction", uikit::getTextUtf8(instructionEdit)}
-                };
-                try {
-                    auto prov = effectiveRuntimeProvider();
-                    st["provider"] = {
-                        {"base_url", prov.baseUrl},
-                        {"api_key", prov.apiKey},
-                        {"model", prov.model},
-                        {"quality", prov.quality},
-                        {"size", prov.size},
-                        {"image_field", prov.imageField},
-                        {"timeout_seconds", prov.timeoutSeconds}
-                    };
-                } catch (...) {}
-                return st;
-            };
-            cbs.onEndpointOverrideChanged = [this](const std::optional<core::SessionEndpointOverride>& ov) {
-                activeOverride = ov;
-                refreshEndpointOverrideUi();
-            };
-            cbs.onPresentOutputFile = [this](const std::filesystem::path& outFile) {
-                resultPaths = {outFile};
-                loadResultFile(outFile);
-            };
-            cbs.onOpenPanel = [this](
-                std::string_view key, void* owner, int32_t wDip, int32_t hDip, std::string_view title,
-                intptr_t(MEMESTUDIO_CALL* proc)(void*, void*, uint32_t, uintptr_t, intptr_t),
-                void* ctx, void(MEMESTUDIO_CALL* destroyFn)(void*)) {
-                return panels.openOrActivatePluginPanel(
-                    key, owner ? owner : hwnd, wDip, hDip, title, proc, ctx, destroyFn);
-            };
-
-            auto nextHost = std::make_unique<core::PluginHost>(
-                httpPool, discoveredPlugins, enabledIds, sigPolicy, std::move(cbs));
-
-            panels.closeAll();
-            activeOverride = nextHost->sessionEndpointOverride();
-            pluginHost = std::move(nextHost);
-            settings.enabledPlugins = enabledIds;
-            settings.signaturePolicy = sigPolicy;
-            core::saveStudioSettings(settings);
-
-            refreshEndpointOverrideUi();
-            rebuildDynamicPluginToolbar();
-            return true;
-        } catch (const std::exception& e) {
-            outErr = e.what();
-            return false;
-        }
-    }
-
-    void setBusyState(bool busy) {
-        workerBusy = busy;
+    void setBusyUi(bool busy) {
         EnableWindow(startBtn, busy ? FALSE : TRUE);
         EnableWindow(cancelBtn, busy ? TRUE : FALSE);
         EnableWindow(fetchModelsBtn, busy ? FALSE : TRUE);
@@ -461,120 +405,40 @@ struct StudioAppWindow {
         refreshEndpointOverrideUi();
     }
 
-    void startReplaceJob() {
-        if (workerBusy) return;
-        try {
-            core::ReplaceTaskConfig task;
-            task.provider = effectiveRuntimeProvider();
-            task.sourcePath = sourcePath;
-            task.characterPath = characterPath;
-            task.characterCrop = characterCanvas.cropRect();
-            task.stylePaths = stylePaths;
-            task.outputPath = base::utf8ToWideStrict(base::trimAscii(uikit::getTextUtf8(outputEdit)));
-            task.instruction = uikit::getTextUtf8(instructionEdit);
-            task.copyCount = settings.copyCount;
-            task.frameStride = settings.frameStride;
-            task.maxFrames = settings.maxFrames;
-            task.temporalConsistency = settings.temporalConsistency;
-            task.preserveText = settings.preserveText;
-            task.allowResume = settings.allowResume;
+    void populateResultsAndSwitchView(const std::vector<std::filesystem::path>& outs) {
+        SendMessageW(copyCombo, CB_RESETCONTENT, 0, 0);
+        for (size_t i = 0; i < outs.size(); ++i) {
+            std::wstring label = std::to_wstring(i + 1) + L". " + outs[i].filename().wstring();
+            SendMessageW(copyCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+        }
+        if (!outs.empty()) {
+            SendMessageW(copyCombo, CB_SETCURSEL, 0, 0);
+        }
+        ShowWindow(copyCombo, outs.size() > 1 ? SW_SHOW : SW_HIDE);
+        EnableWindow(openOutBtn, outs.empty() ? FALSE : TRUE);
+        EnableWindow(openDirBtn, outs.empty() ? FALSE : TRUE);
 
-            if (task.sourcePath.empty()) throw Error("请先选择源表情素材");
-            if (task.characterPath.empty()) throw Error("请先选择目标人物参考图");
-            if (task.outputPath.empty()) throw Error("请指定结果保存路径");
-
-            core::saveStudioSettings(settings);
-
-            if (workerThread.joinable()) workerThread.join();
-            cancelToken.reset();
-            setBusyState(true);
-            SendMessageW(progressBar, PBM_SETPOS, 0, 0);
-            uikit::setTextUtf8(statusLabel, "正在准备生成任务…");
-
-            core::PluginHost* activePlugins = pluginHost.get();
-            workerThread = std::thread([this, task = std::move(task), activePlugins]() {
-                HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-                try {
-                    net::OpenAiImageClient client(httpPool, [activePlugins](
-                        std::string_view op,
-                        const net::ProviderConfig& prov,
-                        const nlohmann::json& meta,
-                        std::span<const net::UploadPart> ups,
-                        net::CancelToken& c,
-                        const net::ImagePreviewFn& prev,
-                        base::Bytes& resp) {
-                        return activePlugins && activePlugins->tryInterceptApi(op, prov, meta, ups, c, prev, resp);
-                    });
-
-                    auto outputs = core::runCharacterReplaceJob(
-                        task, client, activePlugins, cancelToken,
-                        [this](const core::ReplaceProgress& prog) {
-                            WorkerEvent ev;
-                            ev.kind = WorkerEvent::Kind::Progress;
-                            ev.progress = prog;
-                            pushWorkerEvent(std::move(ev));
-                        });
-
-                    WorkerEvent doneEv;
-                    doneEv.kind = WorkerEvent::Kind::JobSucceeded;
-                    doneEv.outputs = std::move(outputs);
-                    pushWorkerEvent(std::move(doneEv));
-                } catch (const std::exception& e) {
-                    WorkerEvent failEv;
-                    failEv.kind = WorkerEvent::Kind::JobFailed;
-                    failEv.errorMessage = e.what();
-                    pushWorkerEvent(std::move(failEv));
-                }
-                if (SUCCEEDED(comHr)) CoUninitialize();
-            });
-        } catch (const std::exception& e) {
-            uikit::showErrorBox(hwnd, "无法启动生成任务", e.what());
+        if (!outs.empty()) {
+            cachedResultAnim = session->currentResultAnimationSnapshot();
+            showingResultView = true;
+            SendMessageW(viewModeCombo, CB_SETCURSEL, 1, 0);
+            currentFrameIdx = 0;
+            updateMainPreviewFrame();
+            if (cachedResultAnim.animated) scheduleNextFrameTimer();
+            else stopPlaybackTimer();
         }
     }
 
-    void startFetchModels() {
-        if (workerBusy) return;
-        try {
-            net::ProviderConfig prov = effectiveRuntimeProvider();
-            if (workerThread.joinable()) workerThread.join();
-            cancelToken.reset();
-            setBusyState(true);
-            uikit::setTextUtf8(statusLabel, "正在获取可用模型列表…");
-
-            core::PluginHost* activePlugins = pluginHost.get();
-            workerThread = std::thread([this, prov = std::move(prov), activePlugins]() {
-                try {
-                    net::OpenAiImageClient client(httpPool, [activePlugins](
-                        std::string_view op, const net::ProviderConfig& p, const nlohmann::json& m,
-                        std::span<const net::UploadPart> u, net::CancelToken& c,
-                        const net::ImagePreviewFn& prev, base::Bytes& r) {
-                        return activePlugins && activePlugins->tryInterceptApi(op, p, m, u, c, prev, r);
-                    });
-                    WorkerEvent ev;
-                    ev.kind = WorkerEvent::Kind::ModelsFetched;
-                    ev.models = client.listModels(prov, cancelToken);
-                    pushWorkerEvent(std::move(ev));
-                } catch (const std::exception& e) {
-                    WorkerEvent failEv;
-                    failEv.kind = WorkerEvent::Kind::JobFailed;
-                    failEv.errorMessage = e.what();
-                    pushWorkerEvent(std::move(failEv));
-                }
-            });
-        } catch (const std::exception& e) {
-            uikit::showErrorBox(hwnd, "获取模型失败", e.what());
-        }
-    }
-
-    void processQueuedWorkerEvents() {
-        std::deque<WorkerEvent> batch;
+    void processQueuedSessionEvents() {
+        std::deque<core::SessionEvent> batch;
         {
             std::lock_guard lock(eventMutex);
             batch.swap(pendingEvents);
         }
+        using K = core::SessionEvent::Kind;
         for (auto& ev : batch) {
             switch (ev.kind) {
-                case WorkerEvent::Kind::Progress: {
+                case K::Progress: {
                     uikit::setTextUtf8(statusLabel, ev.progress.messageUtf8);
                     if (ev.progress.totalFrames > 0) {
                         int pct = (ev.progress.completedFrames * 100) / ev.progress.totalFrames;
@@ -585,34 +449,24 @@ struct StudioAppWindow {
                     }
                     break;
                 }
-                case WorkerEvent::Kind::JobSucceeded: {
-                    if (workerThread.joinable()) workerThread.join();
-                    setBusyState(false);
+                case K::JobSucceeded: {
+                    session->waitForIdle();
+                    setBusyUi(false);
                     SendMessageW(progressBar, PBM_SETPOS, 100, 0);
-                    resultPaths = std::move(ev.outputs);
-
-                    SendMessageW(copyCombo, CB_RESETCONTENT, 0, 0);
-                    for (size_t i = 0; i < resultPaths.size(); ++i) {
-                        std::wstring label = L"结果版本 " + std::to_wstring(i + 1);
-                        SendMessageW(copyCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
-                    }
-                    SendMessageW(copyCombo, CB_SETCURSEL, 0, 0);
-                    ShowWindow(copyCombo, resultPaths.size() > 1 ? SW_SHOW : SW_HIDE);
-                    EnableWindow(openOutBtn, TRUE);
-                    EnableWindow(openDirBtn, TRUE);
-
-                    if (!resultPaths.empty()) {
-                        loadResultFile(resultPaths.front());
-                        std::string msg = "生成完成：" + base::wideToUtf8(resultPaths.front().wstring());
+                    populateResultsAndSwitchView(ev.outputs);
+                    if (!ev.outputs.empty()) {
+                        std::string msg = ev.outputs.size() == 1
+                            ? ("生成完成：" + base::wideToUtf8(ev.outputs.front().wstring()))
+                            : ("批量生成完成（共 " + std::to_string(ev.outputs.size()) + " 个结果文件）");
                         uikit::setTextUtf8(statusLabel, msg);
                         appendLog(msg);
                     }
                     if (closeAfterCancel) DestroyWindow(hwnd);
                     break;
                 }
-                case WorkerEvent::Kind::ModelsFetched: {
-                    if (workerThread.joinable()) workerThread.join();
-                    setBusyState(false);
+                case K::ModelsFetched: {
+                    session->waitForIdle();
+                    setBusyUi(false);
                     std::string previous = uikit::getTextUtf8(modelCombo);
                     SendMessageW(modelCombo, CB_RESETCONTENT, 0, 0);
                     for (const auto& m : ev.models) {
@@ -626,48 +480,52 @@ struct StudioAppWindow {
                     if (closeAfterCancel) DestroyWindow(hwnd);
                     break;
                 }
-                case WorkerEvent::Kind::JobFailed: {
-                    if (workerThread.joinable()) workerThread.join();
-                    setBusyState(false);
-                    bool wasCancelled = cancelToken.isStopped();
-                    std::string msg;
-                    if (wasCancelled) {
-                        msg = sourceAnim.animated ? "已停止（已完成帧缓存保留，下次可断点续传）" : "任务已取消";
-                    } else {
-                        msg = "执行失败：" + ev.errorMessage;
-                        if (!closeAfterCancel) {
-                            uikit::showErrorBox(hwnd, "MemeStudio", ev.errorMessage);
-                        }
-                    }
+                case K::JobFailed: {
+                    session->waitForIdle();
+                    setBusyUi(false);
+                    std::string msg = "任务中断：" + ev.message;
                     uikit::setTextUtf8(statusLabel, msg);
                     appendLog(msg);
+                    if (!closeAfterCancel && ev.message.find("取消") == std::string::npos) {
+                        uikit::showErrorBox(hwnd, "MemeStudio", ev.message);
+                    }
                     if (closeAfterCancel) DestroyWindow(hwnd);
                     break;
                 }
+                case K::EndpointOverrideChanged:
+                    refreshEndpointOverrideUi();
+                    break;
+                case K::PresentOutputFile:
+                    populateResultsAndSwitchView(session->resultPaths());
+                    break;
+                case K::Log:
+                    appendLog(ev.message);
+                    break;
             }
         }
     }
 
     void relayout() {
-        if (!hwnd) return;
+        if (!hwnd || !session) return;
         RECT rc{};
         GetClientRect(hwnd, &rc);
         int totalW = std::max<int>(dpi.px(980), rc.right - rc.left);
         int totalH = std::max<int>(dpi.px(700), rc.bottom - rc.top);
 
         const auto& d = dpi;
+        auto st = session->settingsSnapshot();
         int pad = d.px(12);
         int topBarH = d.px(46);
         int contentTop = topBarH + d.px(6);
         int contentH = totalH - contentTop - pad;
 
-        int leftW = d.px(settings.leftPaneDip);
-        int rightW = d.px(settings.rightPaneDip);
+        int leftW = d.px(st.leftPaneDip);
+        int rightW = d.px(st.rightPaneDip);
         int centerX = pad + leftW + pad;
         int centerW = std::max(d.px(360), totalW - leftW - rightW - pad * 4);
         int rightX = centerX + centerW + pad;
 
-        uikit::DeferBatch batch(56);
+        uikit::DeferBatch batch(64);
 
         // Top Header & Dynamic Plugin Toolbar
         batch.move(headerTitle, pad, d.px(11), d.px(180), d.px(26));
@@ -686,42 +544,55 @@ struct StudioAppWindow {
             }
         }
 
-        // Left Column: Source + Character + Styles + Instruction
+        // Left Column: Source + <- [ 1 ] / N -> Nav Bar + Character + Styles + Instruction
         int ly = contentTop;
-        batch.move(lblSource, pad, ly, d.px(120), d.px(22));
-        batch.move(pickSourceBtn, pad + leftW - d.px(96), ly - d.px(2), d.px(96), d.px(26));
+        batch.move(lblSource, pad, ly, leftW - d.px(142), d.px(22));
+        batch.move(pickSourceFilesBtn, pad + leftW - d.px(138), ly - d.px(2), d.px(76), d.px(26));
+        batch.move(pickSourceDirBtn,   pad + leftW - d.px(58),  ly - d.px(2), d.px(58), d.px(26));
         ly += d.px(26);
-        int srcCanvasH = d.px(136);
+        int srcCanvasH = d.px(122);
         batch.move(sourceCanvas.hwnd(), pad, ly, leftW, srcCanvasH);
-        ly += srcCanvasH + d.px(10);
+        ly += srcCanvasH + d.px(4);
+
+        // Source Switcher Bar: [ <- ]  [  1  ] / N  [ -> ]
+        int navBtnW = d.px(42);
+        int navEditW = d.px(56);
+        int navTotalW = d.px(58);
+        int navGroupW = navBtnW + d.px(6) + navEditW + d.px(4) + navTotalW + d.px(6) + navBtnW;
+        int navStartX = pad + std::max(0, (leftW - navGroupW) / 2);
+        batch.move(prevSourceBtn,       navStartX, ly, navBtnW, d.px(24));
+        batch.move(sourceIndexEdit,     navStartX + navBtnW + d.px(6), ly, navEditW, d.px(24));
+        batch.move(lblSourceSlashTotal, navStartX + navBtnW + d.px(6) + navEditW + d.px(4), ly + d.px(3), navTotalW, d.px(20));
+        batch.move(nextSourceBtn,       navStartX + navGroupW - navBtnW, ly, navBtnW, d.px(24));
+        ly += d.px(32);
 
         batch.move(lblCharacter, pad, ly, d.px(110), d.px(22));
-        batch.move(pickCharBtn, pad + leftW - d.px(148), ly - d.px(2), d.px(70), d.px(26));
-        batch.move(resetCropBtn, pad + leftW - d.px(74), ly - d.px(2), d.px(74), d.px(26));
+        batch.move(pickCharBtn,  pad + leftW - d.px(148), ly - d.px(2), d.px(70), d.px(26));
+        batch.move(resetCropBtn, pad + leftW - d.px(74),  ly - d.px(2), d.px(74), d.px(26));
         ly += d.px(26);
-        int charCanvasH = d.px(146);
+        int charCanvasH = d.px(134);
         batch.move(characterCanvas.hwnd(), pad, ly, leftW, charCanvasH);
-        ly += charCanvasH + d.px(10);
+        ly += charCanvasH + d.px(8);
 
         batch.move(lblStyles, pad, ly, d.px(120), d.px(22));
-        batch.move(addStyleBtn, pad + leftW - d.px(116), ly - d.px(2), d.px(56), d.px(26));
-        batch.move(removeStyleBtn, pad + leftW - d.px(56), ly - d.px(2), d.px(56), d.px(26));
+        batch.move(addStyleBtn,    pad + leftW - d.px(116), ly - d.px(2), d.px(56), d.px(26));
+        batch.move(removeStyleBtn, pad + leftW - d.px(56),  ly - d.px(2), d.px(56), d.px(26));
         ly += d.px(26);
-        batch.move(styleList, pad, ly, leftW, d.px(68));
-        ly += d.px(76);
+        batch.move(styleList, pad, ly, leftW, d.px(64));
+        ly += d.px(72);
 
         batch.move(lblInstruction, pad, ly, d.px(120), d.px(22));
         batch.move(presetsBtn, pad + leftW - d.px(72), ly - d.px(2), d.px(72), d.px(26));
         ly += d.px(26);
-        int instH = std::max(d.px(64), contentTop + contentH - ly);
+        int instH = std::max(d.px(60), contentTop + contentH - ly);
         batch.move(instructionEdit, pad, ly, leftW, instH);
 
-        // Center Column: View Selector + Main Canvas + Scrubber + Output & Generate
+        // Center Column
         int cy = contentTop;
         batch.move(viewModeCombo, centerX, cy, d.px(132), d.px(160));
-        batch.move(copyCombo, centerX + d.px(140), cy, d.px(116), d.px(180));
-        batch.move(openDirBtn, centerX + centerW - d.px(76), cy, d.px(76), d.px(26));
-        batch.move(openOutBtn, centerX + centerW - d.px(158), cy, d.px(76), d.px(26));
+        batch.move(copyCombo,     centerX + d.px(140), cy, d.px(148), d.px(220));
+        batch.move(openDirBtn,    centerX + centerW - d.px(76),  cy, d.px(76), d.px(26));
+        batch.move(openOutBtn,    centerX + centerW - d.px(158), cy, d.px(76), d.px(26));
         cy += d.px(32);
 
         int bottomPanelH = d.px(138);
@@ -729,69 +600,69 @@ struct StudioAppWindow {
         batch.move(mainCanvas.hwnd(), centerX, cy, centerW, mainCanvasH);
         cy += mainCanvasH + d.px(8);
 
-        batch.move(playBtn, centerX, cy, d.px(76), d.px(26));
-        batch.move(scrubber, centerX + d.px(82), cy, std::max(d.px(80), centerW - d.px(222)), d.px(26));
+        batch.move(playBtn,        centerX, cy, d.px(76), d.px(26));
+        batch.move(scrubber,       centerX + d.px(82), cy, std::max(d.px(80), centerW - d.px(222)), d.px(26));
         batch.move(frameInfoLabel, centerX + centerW - d.px(134), cy + d.px(3), d.px(134), d.px(22));
         cy += d.px(34);
 
-        batch.move(lblOutput, centerX, cy + d.px(3), d.px(68), d.px(22));
-        batch.move(outputEdit, centerX + d.px(68), cy, centerW - d.px(112), d.px(26));
+        batch.move(lblOutput,    centerX, cy + d.px(3), d.px(68), d.px(22));
+        batch.move(outputEdit,   centerX + d.px(68), cy, centerW - d.px(112), d.px(26));
         batch.move(browseOutBtn, centerX + centerW - d.px(38), cy, d.px(38), d.px(26));
         cy += d.px(34);
 
         batch.move(progressBar, centerX, cy + d.px(4), centerW - d.px(196), d.px(24));
-        batch.move(startBtn, centerX + centerW - d.px(188), cy, d.px(112), d.px(32));
-        batch.move(cancelBtn, centerX + centerW - d.px(70), cy, d.px(70), d.px(32));
+        batch.move(startBtn,    centerX + centerW - d.px(188), cy, d.px(112), d.px(32));
+        batch.move(cancelBtn,   centerX + centerW - d.px(70),  cy, d.px(70),  d.px(32));
         cy += d.px(36);
         batch.move(statusLabel, centerX, cy, centerW, d.px(22));
 
-        // Right Column: Clean Parameter Form
+        // Right Column
         int ry = contentTop;
-        if (activeOverride.has_value()) {
-            batch.move(overrideBannerLabel, rightX, ry + d.px(3), rightW - d.px(82), d.px(24));
+        if (session->activeEndpointOverride().has_value()) {
+            batch.move(overrideBannerLabel,   rightX, ry + d.px(3), rightW - d.px(82), d.px(24));
             batch.move(disconnectOverrideBtn, rightX + rightW - d.px(78), ry, d.px(78), d.px(26));
             ry += d.px(32);
         }
 
-        batch.move(lblBaseUrl, rightX, ry, rightW, d.px(20)); ry += d.px(20);
+        batch.move(lblBaseUrl,  rightX, ry, rightW, d.px(20)); ry += d.px(20);
         batch.move(baseUrlEdit, rightX, ry, rightW, d.px(26)); ry += d.px(32);
 
-        batch.move(lblKey, rightX, ry, d.px(120), d.px(20));
+        batch.move(lblKey,        rightX, ry, d.px(120), d.px(20));
         batch.move(rememberCheck, rightX + rightW - d.px(130), ry, d.px(130), d.px(20));
         ry += d.px(22);
         batch.move(keyEdit, rightX, ry, rightW, d.px(26)); ry += d.px(32);
 
-        batch.move(lblModel, rightX, ry, rightW, d.px(20)); ry += d.px(20);
-        batch.move(modelCombo, rightX, ry, rightW - d.px(78), d.px(220));
+        batch.move(lblModel,       rightX, ry, rightW, d.px(20)); ry += d.px(20);
+        batch.move(modelCombo,     rightX, ry, rightW - d.px(78), d.px(220));
         batch.move(fetchModelsBtn, rightX + rightW - d.px(72), ry, d.px(72), d.px(26));
         ry += d.px(34);
 
         int halfW = (rightW - d.px(8)) / 2;
-        batch.move(lblQuality, rightX, ry, halfW, d.px(20));
-        batch.move(lblSize, rightX + halfW + d.px(8), ry, halfW, d.px(20));
+        batch.move(lblQuality,   rightX, ry, halfW, d.px(20));
+        batch.move(lblSize,      rightX + halfW + d.px(8), ry, halfW, d.px(20));
         ry += d.px(20);
         batch.move(qualityCombo, rightX, ry, halfW, d.px(180));
-        batch.move(sizeCombo, rightX + halfW + d.px(8), ry, halfW, d.px(180));
+        batch.move(sizeCombo,    rightX + halfW + d.px(8), ry, halfW, d.px(180));
         ry += d.px(32);
 
-        batch.move(lblFormat, rightX, ry, halfW, d.px(20));
-        batch.move(lblCopies, rightX + halfW + d.px(8), ry, halfW, d.px(20));
+        batch.move(lblFormat,     rightX, ry, halfW, d.px(20));
+        batch.move(lblCopies,     rightX + halfW + d.px(8), ry, halfW, d.px(20));
         ry += d.px(20);
-        batch.move(formatCombo, rightX, ry, halfW, d.px(160));
+        batch.move(formatCombo,   rightX, ry, halfW, d.px(160));
         batch.move(copyCountEdit, rightX + halfW + d.px(8), ry, halfW, d.px(26));
         ry += d.px(32);
 
         batch.move(streamCheck, rightX, ry, rightW, d.px(22));
         ry += d.px(28);
 
-        batch.move(lblStride, rightX, ry, halfW, d.px(20));
-        batch.move(lblMaxFrames, rightX + halfW + d.px(8), ry, halfW, d.px(20));
+        batch.move(lblStride,     rightX, ry, halfW, d.px(20));
+        batch.move(lblMaxFrames,  rightX + halfW + d.px(8), ry, halfW, d.px(20));
         ry += d.px(20);
-        batch.move(strideEdit, rightX, ry, halfW, d.px(26));
+        batch.move(strideEdit,    rightX, ry, halfW, d.px(26));
         batch.move(maxFramesEdit, rightX + halfW + d.px(8), ry, halfW, d.px(26));
         ry += d.px(32);
 
-        batch.move(consistencyCheck, rightX, ry, halfW, d.px(22));
+        batch.move(consistencyCheck,  rightX, ry, halfW, d.px(22));
         batch.move(preserveTextCheck, rightX + halfW + d.px(8), ry, halfW, d.px(22));
         ry += d.px(24);
         batch.move(resumeCheck, rightX, ry, rightW, d.px(22));
@@ -805,10 +676,17 @@ struct StudioAppWindow {
 
     void createControls() {
         dpi.updateForWindow(hwnd);
-        settings = core::loadStudioSettings();
+        session = std::make_unique<core::StudioSession>(
+            [this](core::SessionEvent ev) { enqueueSessionEvent(std::move(ev)); },
+            [this](std::string_view key, void* owner, int32_t wDip, int32_t hDip, std::string_view title,
+                   intptr_t(MEMESTUDIO_CALL* proc)(void*, void*, uint32_t, uintptr_t, intptr_t),
+                   void* ctx, void(MEMESTUDIO_CALL* destroyFn)(void*)) {
+                return panels.openOrActivatePluginPanel(key, owner ? owner : hwnd, wDip, hDip, title, proc, ctx, destroyFn);
+            });
+        auto settings = session->settingsSnapshot();
 
-        auto mkLabel = [&](const wchar_t* text) {
-            return CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS,
+        auto mkLabel = [&](const wchar_t* text, DWORD extraStyle = SS_ENDELLIPSIS) {
+            return CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE | extraStyle,
                                    0, 0, 10, 10, hwnd, nullptr, instance, nullptr);
         };
         auto mkBtn = [&](const wchar_t* text, int id, DWORD extraStyle = 0) {
@@ -827,28 +705,38 @@ struct StudioAppWindow {
         headerTitle = mkLabel(L"MemeStudio");
         managePluginsBtn = mkBtn(L"插件管理…", IdManagePluginsBtn);
 
+        // Source section + <- [ 1 ] / N -> navigation switcher
         lblSource = mkLabel(L"源表情素材");
-        pickSourceBtn = mkBtn(L"选择图片…", IdPickSource);
-        sourceCanvas.create(instance, hwnd, "拖入或选择源表情\n(支持 PNG / JPG / WebP / GIF)", false);
-        sourceCanvas.setOnFileDropped([this](const std::filesystem::path& p) { loadSourceFile(p); });
+        pickSourceFilesBtn = mkBtn(L"选择图片…", IdPickSourceFiles);
+        pickSourceDirBtn   = mkBtn(L"目录…", IdPickSourceFolder);
+        sourceCanvas.create(instance, hwnd, "拖入单张/多张图片或文件夹\n(支持 PNG / JPG / WebP / GIF)", false);
+        sourceCanvas.setOnFilesDropped([this](const std::vector<std::filesystem::path>& dropped) {
+            importSourcePathsFromUi(dropped, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+        });
 
+        prevSourceBtn       = mkBtn(L"<-", IdPrevSourceBtn);
+        sourceIndexEdit     = mkEdit(IdSourceIndexEdit, ES_CENTER | ES_NUMBER | ES_AUTOHSCROLL);
+        lblSourceSlashTotal = mkLabel(L"/ 0", SS_LEFT);
+        nextSourceBtn       = mkBtn(L"->", IdNextSourceBtn);
+
+        // Character section
         lblCharacter = mkLabel(L"目标人物参考");
-        pickCharBtn = mkBtn(L"选择…", IdPickCharacter);
+        pickCharBtn  = mkBtn(L"选择…", IdPickCharacter);
         resetCropBtn = mkBtn(L"重置裁剪", IdResetCrop);
         characterCanvas.create(instance, hwnd, "拖入人物参考图\n(左键拖拽框选面部/全身)", true);
-        characterCanvas.setOnFileDropped([this](const std::filesystem::path& p) { loadCharacterFile(p); });
+        characterCanvas.setOnFileDropped([this](const std::filesystem::path& p) { loadCharacterFromUi(p); });
 
-        lblStyles = mkLabel(L"附加画风参考");
-        addStyleBtn = mkBtn(L"添加", IdAddStyle);
+        lblStyles      = mkLabel(L"附加画风参考");
+        addStyleBtn    = mkBtn(L"添加", IdAddStyle);
         removeStyleBtn = mkBtn(L"移除", IdRemoveStyle);
         styleList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL,
             0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IdStyleList)), instance, nullptr);
 
-        lblInstruction = mkLabel(L"附加重绘要求");
-        presetsBtn = mkBtn(L"预设…", IdOpenPresets);
+        lblInstruction  = mkLabel(L"附加重绘要求");
+        presetsBtn      = mkBtn(L"预设…", IdOpenPresets);
         instructionEdit = mkEdit(IdInstructionEdit, ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL | WS_VSCROLL);
 
-        // Center controls (real highlighted dropdown switcher instead of fake stateless pushbuttons!)
+        // Center column
         viewModeCombo = mkCombo(IdViewModeCombo, CBS_DROPDOWNLIST);
         SendMessageW(viewModeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"视图：原表情素材"));
         SendMessageW(viewModeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"视图：生成结果"));
@@ -861,8 +749,10 @@ struct StudioAppWindow {
         EnableWindow(openOutBtn, FALSE);
         EnableWindow(openDirBtn, FALSE);
 
-        mainCanvas.create(instance, hwnd, "选择左侧源表情与目标人物后点击「开始生成」\n滚轮缩放 · 右键拖拽平移 · 双击复位", false);
-        mainCanvas.setOnFileDropped([this](const std::filesystem::path& p) { loadSourceFile(p); });
+        mainCanvas.create(instance, hwnd, "拖入单张/多张图片或文件夹即可预览\n可用左侧 <- 1/N -> 切换或输入序号回车跳转", false);
+        mainCanvas.setOnFilesDropped([this](const std::vector<std::filesystem::path>& dropped) {
+            importSourcePathsFromUi(dropped, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+        });
 
         playBtn = mkBtn(L"▶ 播放", IdPlayPauseBtn);
         scrubber = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
@@ -871,34 +761,34 @@ struct StudioAppWindow {
         EnableWindow(playBtn, FALSE);
         EnableWindow(scrubber, FALSE);
 
-        lblOutput = mkLabel(L"保存路径");
-        outputEdit = mkEdit(IdOutputEdit);
+        lblOutput    = mkLabel(L"保存路径");
+        outputEdit   = mkEdit(IdOutputEdit);
         browseOutBtn = mkBtn(L"…", IdBrowseOutput);
 
         progressBar = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
             0, 0, 10, 10, hwnd, nullptr, instance, nullptr);
-        startBtn = mkBtn(L"开始生成", IdStartGenerate, BS_DEFPUSHBUTTON);
-        cancelBtn = mkBtn(L"取消", IdCancelGenerate);
+        startBtn    = mkBtn(L"开始生成", IdStartGenerate, BS_DEFPUSHBUTTON);
+        cancelBtn   = mkBtn(L"取消", IdCancelGenerate);
         EnableWindow(cancelBtn, FALSE);
         statusLabel = mkLabel(L"就绪");
 
-        // Right controls
-        overrideBannerLabel = mkLabel(L"");
+        // Right column
+        overrideBannerLabel   = mkLabel(L"");
         disconnectOverrideBtn = mkBtn(L"断开接管", IdDisconnectOverride);
         ShowWindow(overrideBannerLabel, SW_HIDE);
         ShowWindow(disconnectOverrideBtn, SW_HIDE);
 
-        lblBaseUrl = mkLabel(L"接口地址 (Base URL)");
+        lblBaseUrl  = mkLabel(L"接口地址 (Base URL)");
         baseUrlEdit = mkEdit(IdBaseUrlEdit);
         uikit::setTextUtf8(baseUrlEdit, settings.provider.baseUrl);
 
-        lblKey = mkLabel(L"API 密钥");
+        lblKey        = mkLabel(L"API 密钥");
         rememberCheck = mkBtn(L"加密记住密钥", IdRememberKeyCheck, BS_AUTOCHECKBOX);
         uikit::setChecked(rememberCheck, settings.rememberKey);
-        keyEdit = mkEdit(IdApiKeyEdit, ES_PASSWORD | ES_AUTOHSCROLL);
+        keyEdit       = mkEdit(IdApiKeyEdit, ES_PASSWORD | ES_AUTOHSCROLL);
         uikit::setTextUtf8(keyEdit, settings.provider.apiKey);
 
-        lblModel = mkLabel(L"模型名称");
+        lblModel   = mkLabel(L"模型名称");
         modelCombo = mkCombo(IdModelCombo, CBS_DROPDOWN | CBS_AUTOHSCROLL);
         for (const wchar_t* presetModel : {L"gpt-image-1", L"gpt-image-1-mini"}) {
             SendMessageW(modelCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(presetModel));
@@ -906,7 +796,7 @@ struct StudioAppWindow {
         uikit::setTextUtf8(modelCombo, settings.provider.model);
         fetchModelsBtn = mkBtn(L"获取列表", IdFetchModelsBtn);
 
-        lblQuality = mkLabel(L"生成画质");
+        lblQuality   = mkLabel(L"生成画质");
         qualityCombo = mkCombo(IdQualityCombo, CBS_DROPDOWNLIST);
         for (const wchar_t* q : {L"auto", L"low", L"medium", L"high"}) {
             SendMessageW(qualityCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(q));
@@ -914,15 +804,15 @@ struct StudioAppWindow {
         SendMessageW(qualityCombo, CB_SELECTSTRING, static_cast<WPARAM>(-1),
             reinterpret_cast<LPARAM>(base::utf8ToWideLossy(settings.provider.quality.empty() ? "auto" : settings.provider.quality).c_str()));
 
-        lblSize = mkLabel(L"图像尺寸");
+        lblSize   = mkLabel(L"图像尺寸");
         sizeCombo = mkCombo(IdSizeCombo, CBS_DROPDOWN);
         for (const wchar_t* sz : {L"auto", L"1024x1024", L"1536x1024", L"1024x1536"}) {
             SendMessageW(sizeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(sz));
         }
         uikit::setTextUtf8(sizeCombo, settings.provider.size.empty() ? "auto" : settings.provider.size);
 
-        lblFormat = mkLabel(L"输出格式");
-        formatCombo = mkCombo(IdFormatCombo_fix(), CBS_DROPDOWNLIST);
+        lblFormat   = mkLabel(L"输出格式");
+        formatCombo = mkCombo(IdOutputFormatCombo, CBS_DROPDOWNLIST);
         for (const wchar_t* f : {L"默认 (不传参)", L"png", L"jpeg", L"webp"}) {
             SendMessageW(formatCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(f));
         }
@@ -933,26 +823,26 @@ struct StudioAppWindow {
                 reinterpret_cast<LPARAM>(base::utf8ToWideLossy(settings.provider.outputFormat).c_str()));
         }
 
-        lblCopies = mkLabel(L"生成份数 (1-10)");
+        lblCopies     = mkLabel(L"生成份数 (1-10)");
         copyCountEdit = mkEdit(IdCopyCountEdit, ES_NUMBER);
         uikit::setTextUtf8(copyCountEdit, std::to_string(settings.copyCount));
 
         streamCheck = mkBtn(L"启用 SSE 流式实时局部预览", IdStreamCheck, BS_AUTOCHECKBOX);
         uikit::setChecked(streamCheck, settings.provider.stream);
 
-        lblStride = mkLabel(L"GIF 抽帧步长");
-        strideEdit = mkEdit(IdStrideEdit, ES_NUMBER);
+        lblStride     = mkLabel(L"GIF 抽帧步长");
+        strideEdit    = mkEdit(IdStrideEdit, ES_NUMBER);
         uikit::setTextUtf8(strideEdit, std::to_string(settings.frameStride));
 
-        lblMaxFrames = mkLabel(L"GIF 最大帧数 (0=不限)");
+        lblMaxFrames  = mkLabel(L"GIF 最大帧数 (0=不限)");
         maxFramesEdit = mkEdit(IdMaxFramesEdit, ES_NUMBER);
         uikit::setTextUtf8(maxFramesEdit, std::to_string(settings.maxFrames));
 
-        consistencyCheck = mkBtn(L"跨帧角色一致", IdConsistencyCheck, BS_AUTOCHECKBOX);
+        consistencyCheck  = mkBtn(L"跨帧角色一致", IdConsistencyCheck, BS_AUTOCHECKBOX);
         uikit::setChecked(consistencyCheck, settings.temporalConsistency);
         preserveTextCheck = mkBtn(L"保留原图文字", IdPreserveTextCheck, BS_AUTOCHECKBOX);
         uikit::setChecked(preserveTextCheck, settings.preserveText);
-        resumeCheck = mkBtn(L"启用异常中断断点续传", IdResumeCheck, BS_AUTOCHECKBOX);
+        resumeCheck       = mkBtn(L"启用异常中断断点续传", IdResumeCheck, BS_AUTOCHECKBOX);
         uikit::setChecked(resumeCheck, settings.allowResume);
 
         activeFiltersLabel = mkLabel(L"已挂载管线滤镜：无");
@@ -961,13 +851,15 @@ struct StudioAppWindow {
         dpi.applyNormalFontToChildren(hwnd);
         SendMessageW(headerTitle, WM_SETFONT, reinterpret_cast<WPARAM>(dpi.titleFont()), TRUE);
 
-        std::string pluginErr;
-        if (!reloadPlugins(settings.enabledPlugins, settings.signaturePolicy, pluginErr)) {
-            appendLog("部分已记录插件未能自动启用：" + pluginErr);
+        // Re-bind openPanel hook on initial reload so plugin popups attach to hwnd
+        std::string reloadErr;
+        if (!session->reloadPlugins(settings.enabledPlugins, settings.signaturePolicy, reloadErr) && !reloadErr.empty()) {
+            appendLog("部分历史插件未自动加载：" + reloadErr);
         }
+        refreshSourceNavigationAndPreview(false);
+        refreshEndpointOverrideUi();
+        rebuildDynamicPluginToolbar();
     }
-
-    static constexpr int IdFormatCombo_fix() noexcept { return IdOutputFormatCombo; }
 
     void handleCommand(int id, int notifyCode) {
         if (id >= IdPluginToolbarBase &&
@@ -978,47 +870,76 @@ struct StudioAppWindow {
         }
 
         switch (id) {
-            case IdPickSource: {
-                if (auto p = uikit::pickOpenImageFile(hwnd, L"选择源表情图片或 GIF")) {
-                    loadSourceFile(*p);
+            case IdPickSourceFiles: {
+                auto picked = uikit::pickOpenMultipleImageFiles(hwnd, L"选择一张或多张源表情图片 / GIF（按住 Ctrl/Shift 可多选）");
+                if (!picked.empty()) {
+                    importSourcePathsFromUi(picked, false);
                 }
+                break;
+            }
+            case IdPickSourceFolder: {
+                if (auto folder = uikit::pickFolder(hwnd, L"选择源表情所在文件夹")) {
+                    importSourcePathsFromUi({*folder}, false);
+                }
+                break;
+            }
+            case IdPrevSourceBtn: {
+                if (session && session->stepSourceIndex(-1)) {
+                    showingResultView = false;
+                    SendMessageW(viewModeCombo, CB_SETCURSEL, 0, 0);
+                    refreshSourceNavigationAndPreview(session->sourceCount() == 1);
+                }
+                break;
+            }
+            case IdNextSourceBtn: {
+                if (session && session->stepSourceIndex(+1)) {
+                    showingResultView = false;
+                    SendMessageW(viewModeCombo, CB_SETCURSEL, 0, 0);
+                    refreshSourceNavigationAndPreview(session->sourceCount() == 1);
+                }
+                break;
+            }
+            case IdSourceIndexEdit: {
+                if (notifyCode == EN_KILLFOCUS) {
+                    commitJumpSourceIndexFromEdit();
+                }
+                break;
+            }
+            case IdJumpSourceCommit: {
+                commitJumpSourceIndexFromEdit();
+                SendMessageW(sourceIndexEdit, EM_SETSEL, 0, -1);
                 break;
             }
             case IdPickCharacter: {
                 if (auto p = uikit::pickOpenImageFile(hwnd, L"选择目标人物参考图片")) {
-                    loadCharacterFile(*p);
+                    loadCharacterFromUi(*p);
                 }
                 break;
             }
             case IdResetCrop: {
                 characterCanvas.setCropRect({0.0, 0.0, 1.0, 1.0});
+                if (session) session->setCharacterCrop({0.0, 0.0, 1.0, 1.0});
                 break;
             }
             case IdAddStyle: {
                 auto picked = uikit::pickOpenMultipleImageFiles(hwnd);
-                for (const auto& p : picked) {
-                    if (stylePaths.size() >= 8) {
-                        uikit::showErrorBox(hwnd, "MemeStudio", "最多支持添加 8 张附加画风参考图");
-                        break;
-                    }
-                    bool dup = std::any_of(stylePaths.begin(), stylePaths.end(), [&](const auto& ex) {
-                        return base::isSameFilePath(ex, p);
-                    });
-                    if (!dup) {
-                        stylePaths.push_back(p);
-                        std::wstring wn = p.filename().wstring();
+                if (session) {
+                    session->addStyleFiles(picked);
+                    SendMessageW(styleList, LB_RESETCONTENT, 0, 0);
+                    auto allStyles = session->stylePaths();
+                    for (const auto& sp : allStyles) {
+                        std::wstring wn = sp.filename().wstring();
                         SendMessageW(styleList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(wn.c_str()));
                     }
+                    uikit::setTextUtf8(lblStyles, "附加画风参考 (" + std::to_string(allStyles.size()) + "/8)");
                 }
-                uikit::setTextUtf8(lblStyles, "附加画风参考 (" + std::to_string(stylePaths.size()) + "/8)");
                 break;
             }
             case IdRemoveStyle: {
                 LRESULT sel = SendMessageW(styleList, LB_GETCURSEL, 0, 0);
-                if (sel >= 0 && static_cast<size_t>(sel) < stylePaths.size()) {
-                    stylePaths.erase(stylePaths.begin() + sel);
+                if (sel >= 0 && session && session->removeStyleAt(static_cast<size_t>(sel))) {
                     SendMessageW(styleList, LB_DELETESTRING, static_cast<WPARAM>(sel), 0);
-                    uikit::setTextUtf8(lblStyles, "附加画风参考 (" + std::to_string(stylePaths.size()) + "/8)");
+                    uikit::setTextUtf8(lblStyles, "附加画风参考 (" + std::to_string(session->stylePaths().size()) + "/8)");
                 }
                 break;
             }
@@ -1046,24 +967,40 @@ struct StudioAppWindow {
                 break;
             }
             case IdCopySelectCombo: {
-                if (notifyCode == CBN_SELCHANGE) {
+                if (notifyCode == CBN_SELCHANGE && session) {
                     LRESULT sel = SendMessageW(copyCombo, CB_GETCURSEL, 0, 0);
-                    if (sel >= 0 && static_cast<size_t>(sel) < resultPaths.size()) {
-                        loadResultFile(resultPaths[static_cast<size_t>(sel)]);
+                    if (sel >= 0 && session->selectResultIndex(static_cast<size_t>(sel))) {
+                        cachedResultAnim = session->currentResultAnimationSnapshot();
+                        showingResultView = true;
+                        SendMessageW(viewModeCombo, CB_SETCURSEL, 1, 0);
+                        currentFrameIdx = 0;
+                        updateMainPreviewFrame();
+                        if (cachedResultAnim.animated) scheduleNextFrameTimer();
+                        else stopPlaybackTimer();
                     }
                 }
                 break;
             }
             case IdOpenOutputBtn: {
-                if (!resultPaths.empty()) {
-                    ShellExecuteW(hwnd, L"open", resultPaths.front().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                if (session) {
+                    auto outs = session->resultPaths();
+                    LRESULT sel = SendMessageW(copyCombo, CB_GETCURSEL, 0, 0);
+                    size_t idx = (sel >= 0 && static_cast<size_t>(sel) < outs.size()) ? static_cast<size_t>(sel) : 0;
+                    if (idx < outs.size()) {
+                        ShellExecuteW(hwnd, L"open", outs[idx].c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    }
                 }
                 break;
             }
             case IdOpenFolderBtn: {
-                if (!resultPaths.empty()) {
-                    std::wstring param = L"/select,\"" + resultPaths.front().wstring() + L"\"";
-                    ShellExecuteW(hwnd, L"open", L"explorer.exe", param.c_str(), nullptr, SW_SHOWNORMAL);
+                if (session) {
+                    auto outs = session->resultPaths();
+                    LRESULT sel = SendMessageW(copyCombo, CB_GETCURSEL, 0, 0);
+                    size_t idx = (sel >= 0 && static_cast<size_t>(sel) < outs.size()) ? static_cast<size_t>(sel) : 0;
+                    if (idx < outs.size()) {
+                        std::wstring param = L"/select,\"" + outs[idx].wstring() + L"\"";
+                        ShellExecuteW(hwnd, L"open", L"explorer.exe", param.c_str(), nullptr, SW_SHOWNORMAL);
+                    }
                 }
                 break;
             }
@@ -1073,37 +1010,71 @@ struct StudioAppWindow {
                 break;
             }
             case IdBrowseOutput: {
-                std::filesystem::path curOut = base::utf8ToWideLossy(uikit::getTextUtf8(outputEdit));
-                if (auto p = uikit::pickSaveOutputFile(hwnd, curOut, sourceAnim.animated)) {
-                    uikit::setTextUtf8(outputEdit, base::wideToUtf8(p->wstring()));
+                if (!session) break;
+                if (session->sourceCount() > 1) {
+                    if (auto dir = uikit::pickFolder(hwnd, L"选择多源批量输出目录")) {
+                        uikit::setTextUtf8(outputEdit, base::wideToUtf8(dir->wstring()));
+                    }
+                } else {
+                    std::filesystem::path curOut = base::utf8ToWideLossy(uikit::getTextUtf8(outputEdit));
+                    if (auto p = uikit::pickSaveOutputFile(hwnd, curOut, cachedSourceAnim.animated)) {
+                        uikit::setTextUtf8(outputEdit, base::wideToUtf8(p->wstring()));
+                    }
                 }
                 break;
             }
-            case IdStartGenerate:
-                startReplaceJob();
+            case IdStartGenerate: {
+                if (!session || session->isBusy()) break;
+                try {
+                    syncControlsIntoSession(true);
+                    std::filesystem::path outTarget = base::utf8ToWideStrict(base::trimAscii(uikit::getTextUtf8(outputEdit)));
+                    session->startReplaceJob(outTarget, uikit::getTextUtf8(instructionEdit));
+                    setBusyUi(true);
+                    SendMessageW(progressBar, PBM_SETPOS, 0, 0);
+                    uikit::setTextUtf8(statusLabel, "正在准备生成任务…");
+                } catch (const std::exception& e) {
+                    uikit::showErrorBox(hwnd, "无法启动生成任务", e.what());
+                }
                 break;
-            case IdCancelGenerate:
-                if (workerBusy) {
-                    cancelToken.stop();
+            }
+            case IdCancelGenerate: {
+                if (session && session->isBusy()) {
+                    session->cancelActiveJob();
                     uikit::setTextUtf8(statusLabel, "正在停止当前任务…");
                 }
                 break;
-            case IdFetchModelsBtn:
-                startFetchModels();
+            }
+            case IdFetchModelsBtn: {
+                if (!session || session->isBusy()) break;
+                try {
+                    syncControlsIntoSession(false);
+                    session->startFetchModels();
+                    setBusyUi(true);
+                    uikit::setTextUtf8(statusLabel, "正在获取可用模型列表…");
+                } catch (const std::exception& e) {
+                    uikit::showErrorBox(hwnd, "获取模型失败", e.what());
+                }
                 break;
+            }
             case IdDisconnectOverride:
-                if (pluginHost) pluginHost->clearSessionEndpointOverride();
+                if (session) session->clearEndpointOverride();
                 break;
             case IdManagePluginsBtn: {
-                discoveredPlugins = core::discoverPluginsInDirectory(base::defaultPluginsDir());
+                if (!session) break;
+                auto discovered = session->discoverAndListPlugins();
+                auto curSt = session->settingsSnapshot();
                 openPluginManagerDialog(
                     instance,
                     hwnd,
-                    discoveredPlugins,
-                    settings.enabledPlugins,
-                    settings.signaturePolicy,
+                    discovered,
+                    curSt.enabledPlugins,
+                    curSt.signaturePolicy,
                     [this](const std::vector<std::string>& nextEn, core::SignaturePolicy pol, std::string& err) {
-                        return reloadPlugins(nextEn, pol, err);
+                        panels.closeAll();
+                        if (!session->reloadPlugins(nextEn, pol, err)) return false;
+                        refreshEndpointOverrideUi();
+                        rebuildDynamicPluginToolbar();
+                        return true;
                     },
                     [this](const std::string& pid, const std::string& cid) {
                         invokePluginCommandSafe(pid, cid);
@@ -1114,10 +1085,10 @@ struct StudioAppWindow {
     }
 
     void invokePluginCommandSafe(const std::string& pluginId, const std::string& commandId) {
-        if (!pluginHost) return;
+        if (!session) return;
         try {
-            net::CancelToken cmdCancel;
-            pluginHost->invokeCommand(pluginId, commandId, nlohmann::json::object(), hwnd, cmdCancel);
+            syncControlsIntoSession(false);
+            session->invokePluginCommand(pluginId, commandId, nlohmann::json::object(), hwnd);
         } catch (const std::exception& e) {
             uikit::showErrorBox(hwnd, "执行插件操作失败", e.what());
         }
@@ -1170,9 +1141,7 @@ struct StudioAppWindow {
             }
 
             case WM_SIZE:
-                if (wp != SIZE_MINIMIZED) {
-                    app->relayout();
-                }
+                if (wp != SIZE_MINIMIZED) app->relayout();
                 return 0;
 
             case WM_HSCROLL: {
@@ -1207,17 +1176,13 @@ struct StudioAppWindow {
                 app->handleCommand(LOWORD(wp), HIWORD(wp));
                 return 0;
 
-            case WM_WORKER_EVENT:
-                app->processQueuedWorkerEvents();
+            case WM_SESSION_EVENT:
+                app->processQueuedSessionEvents();
                 return 0;
 
             case WM_CLOSE: {
-                try {
-                    app->syncSettingsFromControls();
-                    core::saveStudioSettings(app->settings);
-                } catch (...) {}
-
-                if (app->workerBusy) {
+                try { app->syncControlsIntoSession(true); } catch (...) {}
+                if (app->session && app->session->isBusy()) {
                     int choice = MessageBoxW(
                         window,
                         L"当前有生成任务正在运行，是否立即取消任务并退出 MemeStudio？",
@@ -1225,7 +1190,7 @@ struct StudioAppWindow {
                         MB_YESNO | MB_ICONQUESTION);
                     if (choice != IDYES) return 0;
                     app->closeAfterCancel = true;
-                    app->cancelToken.stop();
+                    app->session->cancelActiveJob();
                     uikit::setTextUtf8(app->statusLabel, "正在停止后台任务并准备退出…");
                     EnableWindow(window, FALSE);
                     return 0;
@@ -1281,12 +1246,17 @@ int runStudioDesktopApp(HINSTANCE instance, const std::filesystem::path& initial
     ShowWindow(win, SW_SHOW);
     UpdateWindow(win);
 
-    if (!initialSource.empty() && std::filesystem::is_regular_file(initialSource)) {
-        app.loadSourceFile(initialSource);
+    if (!initialSource.empty() && std::filesystem::exists(initialSource)) {
+        app.importSourcePathsFromUi({initialSource}, false);
     }
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        // Pressing Enter inside the source jump index edit box jumps immediately to that image!
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && msg.hwnd == app.sourceIndexEdit) {
+            SendMessageW(win, WM_COMMAND, MAKEWPARAM(IdJumpSourceCommit, 0), 0);
+            continue;
+        }
         if (!app.panels.translateDialogNavigation(msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);

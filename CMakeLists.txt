@@ -1,13 +1,14 @@
 cmake_minimum_required(VERSION 3.24)
-project(MemeStudio VERSION 2.0.0 LANGUAGES CXX)
+project(MemeStudio VERSION 2.1.0 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "MemeStudio requires Windows 10 (1903+) or newer.")
 endif()
 
-option(MEMESTUDIO_BUILD_GUI   "Build Win32 desktop application MemeStudio.exe" ON)
-option(MEMESTUDIO_BUILD_CLI   "Build headless CLI tool MemeStudio-cli.exe" ON)
-option(MEMESTUDIO_BUILD_TESTS "Build unit and E2E test suites" ON)
+option(MEMESTUDIO_BUILD_ENGINE_DLL "Build frontend-agnostic C ABI engine DLL (MemeStudioEngine.dll)" ON)
+option(MEMESTUDIO_BUILD_GUI        "Build Win32 desktop application MemeStudio.exe" ON)
+option(MEMESTUDIO_BUILD_CLI        "Build headless CLI tool MemeStudio-cli.exe" ON)
+option(MEMESTUDIO_BUILD_TESTS      "Build unit and E2E test suites" ON)
 
 add_library(meme_compiler_flags INTERFACE)
 target_compile_features(meme_compiler_flags INTERFACE cxx_std_20)
@@ -17,7 +18,7 @@ if(MSVC)
     target_compile_options(meme_compiler_flags INTERFACE /utf-8 /W4 /EHsc /permissive-)
 endif()
 
-# 1. Pure Headless Microkernel Core (zero GUI / dialog / test code!)
+# 1. Pure Headless Microkernel Core + Stateful StudioSession (zero GUI / dialog / test code!)
 add_library(meme_core STATIC
     src/base/utf8.cpp
     src/base/crypto.cpp
@@ -34,6 +35,7 @@ add_library(meme_core STATIC
     src/core/prompt_builder.cpp
     src/core/replace_engine.cpp
     src/core/plugin_host.cpp
+    src/core/studio_session.cpp
 )
 target_include_directories(meme_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -47,7 +49,21 @@ if(MSVC)
     set_property(TARGET meme_core PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# 2. Pure Headless CLI (independent of MemeStudio GUI target, zero GDI/comctl32/comdlg32!)
+# 2. Language-Neutral C ABI Backend Engine DLL (ready for WinUI 3 C#/.NET AOT, C++/WinRT, Tauri, Qt)
+if(MEMESTUDIO_BUILD_ENGINE_DLL)
+    add_library(MemeStudioEngine SHARED
+        src/engine/engine_c_api.cpp)
+    target_include_directories(MemeStudioEngine PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/sdk")
+    target_include_directories(MemeStudioEngine SYSTEM PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/vendor")
+    target_link_libraries(MemeStudioEngine PRIVATE meme_core ole32)
+    if(MSVC)
+        set_property(TARGET MemeStudioEngine PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+endif()
+
+# 3. Pure Headless CLI (independent of GUI target, zero GDI/comctl32/comdlg32!)
 if(MEMESTUDIO_BUILD_CLI)
     add_executable(MemeStudio-cli
         src/cli/cli_main.cpp)
@@ -62,7 +78,7 @@ if(MEMESTUDIO_BUILD_CLI)
     endif()
 endif()
 
-# 3. PerMonitorV2 DPI-Aware Win32 UIKit + Clean 3-Column Desktop App (zero tests/*.cpp linked!)
+# 4. PerMonitorV2 DPI-Aware Win32 UIKit + Thin Desktop Frontend (driving StudioSession)
 if(MEMESTUDIO_BUILD_GUI)
     add_library(meme_uikit STATIC
         src/uikit/dpi.cpp
@@ -96,7 +112,7 @@ if(MEMESTUDIO_BUILD_GUI)
     endif()
 endif()
 
-# 4. Standalone Automated Test Targets (never compiled into production MemeStudio.exe!)
+# 5. Standalone Automated Test Targets
 if(MEMESTUDIO_BUILD_TESTS)
     enable_testing()
     add_executable(MemeStudioTests
@@ -104,6 +120,9 @@ if(MEMESTUDIO_BUILD_TESTS)
     target_include_directories(MemeStudioTests SYSTEM PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/vendor")
     target_link_libraries(MemeStudioTests PRIVATE meme_core ole32)
+    if(MEMESTUDIO_BUILD_ENGINE_DLL)
+        target_link_libraries(MemeStudioTests PRIVATE MemeStudioEngine)
+    endif()
     if(MSVC)
         set_property(TARGET MemeStudioTests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
         target_link_options(MemeStudioTests PRIVATE /ENTRY:wmainCRTStartup)

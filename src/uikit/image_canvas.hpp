@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace meme::uikit {
 
@@ -37,6 +38,7 @@ public:
 
     void setOnCropChanged(std::function<void(const media::NormalizedRect&)> cb);
     void setOnFileDropped(std::function<void(const fs::path&)> cb);
+    void setOnFilesDropped(std::function<void(const std::vector<fs::path>&)> cb);
     void notifyDpiChanged(UINT newDpi) noexcept;
 };
 
