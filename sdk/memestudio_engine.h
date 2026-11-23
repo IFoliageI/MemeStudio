@@ -122,11 +122,21 @@ MEME_ENGINE_API int32_t MEME_ENGINE_CALL meme_session_read_frame_pargb32(
     size_t dst_stride_bytes,
     MemeEngineBuffer* out_err_utf8);
 
-/* Async job & model discovery */
+/* Async creative workflows (character replace, prompt draw, and prompt/region retouch) & model discovery */
 MEME_ENGINE_API int32_t MEME_ENGINE_CALL meme_session_start_replace(
     MemeEngineSession* session,
     const char* output_target_utf8,
     const char* instruction_utf8,
+    MemeEngineBuffer* out_err_utf8);
+
+MEME_ENGINE_API int32_t MEME_ENGINE_CALL meme_session_start_draw(
+    MemeEngineSession* session,
+    const char* draw_request_json_utf8,
+    MemeEngineBuffer* out_err_utf8);
+
+MEME_ENGINE_API int32_t MEME_ENGINE_CALL meme_session_start_retouch(
+    MemeEngineSession* session,
+    const char* retouch_request_json_utf8,
     MemeEngineBuffer* out_err_utf8);
 
 MEME_ENGINE_API int32_t MEME_ENGINE_CALL meme_session_start_fetch_models(

@@ -34,6 +34,8 @@ add_library(meme_core STATIC
     src/core/config_store.cpp
     src/core/prompt_builder.cpp
     src/core/replace_engine.cpp
+    src/core/draw_engine.cpp
+    src/core/retouch_engine.cpp
     src/core/plugin_host.cpp
     src/core/studio_session.cpp
 )
@@ -100,6 +102,8 @@ if(MEMESTUDIO_BUILD_GUI)
         src/gui/win_main.cpp
         src/gui/presets_dialog.cpp
         src/gui/plugin_dialog.cpp
+        src/gui/draw_dialog.cpp
+        src/gui/retouch_dialog.cpp
         src/gui/studio_window.cpp)
     target_include_directories(MemeStudio SYSTEM PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/vendor")

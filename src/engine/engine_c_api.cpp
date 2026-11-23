@@ -361,6 +361,63 @@ MEME_ENGINE_API int32_t MEME_ENGINE_CALL meme_session_start_replace(
     }
 }
 
+MEME_ENGINE_API int32_t MEME_ENGINE_CALL meme_session_start_draw(
+    MemeEngineSession* session,
+    const char* draw_request_json_utf8,
+    MemeEngineBuffer* out_err_utf8) {
+    if (!session || !draw_request_json_utf8) return -1;
+    try {
+        Json j = Json::parse(draw_request_json_utf8);
+        meme::core::PromptDrawTaskConfig cfg;
+        cfg.provider = session->impl->effectiveProvider();
+        cfg.prompt = j.at("prompt").get<std::string>();
+        cfg.outputPath = meme::base::utf8ToWideStrict(j.at("output").get<std::string>());
+        cfg.copyCount = j.value("count", 1);
+        if (j.contains("quality")) cfg.provider.quality = j["quality"].get<std::string>();
+        if (j.contains("size")) cfg.provider.size = j["size"].get<std::string>();
+        for (const auto& sp : j.value("styles", Json::array())) {
+            cfg.stylePaths.push_back(meme::base::utf8ToWideStrict(sp.get<std::string>()));
+        }
+        session->impl->startPromptDrawJob(std::move(cfg));
+        return 0;
+    } catch (const std::exception& e) {
+        writeEngineBuf(out_err_utf8, e.what());
+        return -1;
+    }
+}
+
+MEME_ENGINE_API int32_t MEME_ENGINE_CALL meme_session_start_retouch(
+    MemeEngineSession* session,
+    const char* retouch_request_json_utf8,
+    MemeEngineBuffer* out_err_utf8) {
+    if (!session || !retouch_request_json_utf8) return -1;
+    try {
+        Json j = Json::parse(retouch_request_json_utf8);
+        meme::core::RetouchTaskConfig cfg;
+        cfg.provider = session->impl->effectiveProvider();
+        cfg.sourcePath = meme::base::utf8ToWideStrict(j.at("source").get<std::string>());
+        cfg.outputPath = meme::base::utf8ToWideStrict(j.at("output").get<std::string>());
+        cfg.instruction = j.at("instruction").get<std::string>();
+        std::string modeStr = j.value("mode", "prompt");
+        cfg.mode = (modeStr == "region") ? meme::core::RetouchMode::RegionRedraw : meme::core::RetouchMode::PromptEdit;
+        if (j.contains("region") && j["region"].is_object()) {
+            const auto& r = j["region"];
+            cfg.region = {r.value("x", 0.0), r.value("y", 0.0), r.value("width", 1.0), r.value("height", 1.0)};
+        }
+        cfg.copyCount = j.value("count", 1);
+        cfg.preserveText = j.value("preserve_text", true);
+        cfg.temporalConsistency = j.value("consistency", true);
+        for (const auto& sp : j.value("styles", Json::array())) {
+            cfg.stylePaths.push_back(meme::base::utf8ToWideStrict(sp.get<std::string>()));
+        }
+        session->impl->startRetouchJob(std::move(cfg));
+        return 0;
+    } catch (const std::exception& e) {
+        writeEngineBuf(out_err_utf8, e.what());
+        return -1;
+    }
+}
+
 MEME_ENGINE_API int32_t MEME_ENGINE_CALL meme_session_start_fetch_models(
     MemeEngineSession* session,
     MemeEngineBuffer* out_err_utf8) {

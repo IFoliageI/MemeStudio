@@ -1,6 +1,8 @@
 #include "gui/studio_window.hpp"
+#include "gui/draw_dialog.hpp"
 #include "gui/plugin_dialog.hpp"
 #include "gui/presets_dialog.hpp"
+#include "gui/retouch_dialog.hpp"
 #include "core/studio_session.hpp"
 #include "uikit/controls.hpp"
 #include "uikit/dpi.hpp"
@@ -72,6 +74,8 @@ enum MainControlId : int {
     IdPreserveTextCheck  = 1054,
     IdResumeCheck        = 1055,
     IdManagePluginsBtn   = 1060,
+    IdOpenBuiltinDrawBtn = 1061,
+    IdOpenBuiltinRetouch = 1062,
 
     IdPluginToolbarBase  = 1500
 };
@@ -109,6 +113,8 @@ struct StudioAppWindow {
 
     // Controls
     HWND headerTitle = nullptr;
+    HWND openDrawBtn = nullptr;
+    HWND openRetouchBtn = nullptr;
     HWND managePluginsBtn = nullptr;
 
     // Left column (Source + <- [1]/N -> switcher + Character + Styles + Instruction)
@@ -365,11 +371,11 @@ struct StudioAppWindow {
         }
         toolbarActions.clear();
 
-        std::string filterSummary = "已挂载管线滤镜：无";
+        std::string filterSummary = "图像增强滤镜：未启用";
         if (session) {
             auto fp = session->activePipelineFiltersJson();
             if (!fp.empty()) {
-                filterSummary = "已启用管线滤镜：";
+                filterSummary = "已启用滤镜：";
                 for (size_t i = 0; i < fp.size(); ++i) {
                     if (i > 0) filterSummary += "、";
                     filterSummary += fp[i].value("id", "");
@@ -527,8 +533,11 @@ struct StudioAppWindow {
 
         uikit::DeferBatch batch(64);
 
-        // Top Header & Dynamic Plugin Toolbar
-        batch.move(headerTitle, pad, d.px(11), d.px(180), d.px(26));
+        // Top Header: Title + Built-in Creative Tools + Dynamic Plugin Extensions + Plugin Manager
+        batch.move(headerTitle,    pad, d.px(11), d.px(136), d.px(26));
+        batch.move(openDrawBtn,    pad + d.px(142), d.px(9), d.px(112), d.px(30));
+        batch.move(openRetouchBtn, pad + d.px(260), d.px(9), d.px(122), d.px(30));
+
         int manageW = d.px(104);
         batch.move(managePluginsBtn, totalW - pad - manageW, d.px(9), manageW, d.px(30));
 
@@ -536,7 +545,7 @@ struct StudioAppWindow {
         for (auto it = toolbarActions.rbegin(); it != toolbarActions.rend(); ++it) {
             int btnW = d.px(114);
             tbX -= (btnW + d.px(6));
-            if (tbX >= d.px(195)) {
+            if (tbX >= pad + d.px(392)) {
                 ShowWindow(it->button, SW_SHOW);
                 batch.move(it->button, tbX, d.px(9), btnW, d.px(30));
             } else {
@@ -702,14 +711,16 @@ struct StudioAppWindow {
                                    0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance, nullptr);
         };
 
-        headerTitle = mkLabel(L"MemeStudio");
+        headerTitle      = mkLabel(L"MemeStudio");
+        openDrawBtn      = mkBtn(L"提示词生图…", IdOpenBuiltinDrawBtn);
+        openRetouchBtn   = mkBtn(L"精修 / 修图…", IdOpenBuiltinRetouch);
         managePluginsBtn = mkBtn(L"插件管理…", IdManagePluginsBtn);
 
         // Source section + <- [ 1 ] / N -> navigation switcher
         lblSource = mkLabel(L"源表情素材");
         pickSourceFilesBtn = mkBtn(L"选择图片…", IdPickSourceFiles);
         pickSourceDirBtn   = mkBtn(L"目录…", IdPickSourceFolder);
-        sourceCanvas.create(instance, hwnd, "拖入单张/多张图片或文件夹\n(支持 PNG / JPG / WebP / GIF)", false);
+        sourceCanvas.create(instance, hwnd, "拖入单张/多张表情图或文件夹\n(支持 PNG / JPG / WebP / GIF)", false);
         sourceCanvas.setOnFilesDropped([this](const std::vector<std::filesystem::path>& dropped) {
             importSourcePathsFromUi(dropped, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
         });
@@ -827,7 +838,7 @@ struct StudioAppWindow {
         copyCountEdit = mkEdit(IdCopyCountEdit, ES_NUMBER);
         uikit::setTextUtf8(copyCountEdit, std::to_string(settings.copyCount));
 
-        streamCheck = mkBtn(L"启用 SSE 流式实时局部预览", IdStreamCheck, BS_AUTOCHECKBOX);
+        streamCheck = mkBtn(L"生成时实时显示草图过程（流式预览）", IdStreamCheck, BS_AUTOCHECKBOX);
         uikit::setChecked(streamCheck, settings.provider.stream);
 
         lblStride     = mkLabel(L"GIF 抽帧步长");
@@ -838,14 +849,14 @@ struct StudioAppWindow {
         maxFramesEdit = mkEdit(IdMaxFramesEdit, ES_NUMBER);
         uikit::setTextUtf8(maxFramesEdit, std::to_string(settings.maxFrames));
 
-        consistencyCheck  = mkBtn(L"跨帧角色一致", IdConsistencyCheck, BS_AUTOCHECKBOX);
+        consistencyCheck  = mkBtn(L"动图跨帧角色一致", IdConsistencyCheck, BS_AUTOCHECKBOX);
         uikit::setChecked(consistencyCheck, settings.temporalConsistency);
-        preserveTextCheck = mkBtn(L"保留原图文字", IdPreserveTextCheck, BS_AUTOCHECKBOX);
+        preserveTextCheck = mkBtn(L"保留原图已有文字", IdPreserveTextCheck, BS_AUTOCHECKBOX);
         uikit::setChecked(preserveTextCheck, settings.preserveText);
-        resumeCheck       = mkBtn(L"启用异常中断断点续传", IdResumeCheck, BS_AUTOCHECKBOX);
+        resumeCheck       = mkBtn(L"动图中断后保留进度（支持续传）", IdResumeCheck, BS_AUTOCHECKBOX);
         uikit::setChecked(resumeCheck, settings.allowResume);
 
-        activeFiltersLabel = mkLabel(L"已挂载管线滤镜：无");
+        activeFiltersLabel = mkLabel(L"图像增强滤镜：未启用");
         logEdit = mkEdit(0, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL);
 
         dpi.applyNormalFontToChildren(hwnd);
@@ -1059,6 +1070,30 @@ struct StudioAppWindow {
             case IdDisconnectOverride:
                 if (session) session->clearEndpointOverride();
                 break;
+            case IdOpenBuiltinDrawBtn: {
+                if (!session) break;
+                openPromptDrawWorkbench(
+                    instance,
+                    hwnd,
+                    panels,
+                    *session,
+                    [this](const std::filesystem::path& drawnFile) {
+                        openRetouchWorkbench(instance, hwnd, panels, *session, drawnFile, [this]() {
+                            try { syncControlsIntoSession(false); } catch (...) {}
+                        });
+                    },
+                    [this]() {
+                        try { syncControlsIntoSession(false); } catch (...) {}
+                    });
+                break;
+            }
+            case IdOpenBuiltinRetouch: {
+                if (!session) break;
+                openRetouchWorkbench(instance, hwnd, panels, *session, {}, [this]() {
+                    try { syncControlsIntoSession(false); } catch (...) {}
+                });
+                break;
+            }
             case IdManagePluginsBtn: {
                 if (!session) break;
                 auto discovered = session->discoverAndListPlugins();

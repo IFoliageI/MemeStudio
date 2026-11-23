@@ -1,7 +1,9 @@
 #pragma once
 #include "core/config_store.hpp"
+#include "core/draw_engine.hpp"
 #include "core/plugin_host.hpp"
 #include "core/replace_engine.hpp"
+#include "core/retouch_engine.hpp"
 #include "media/image_types.hpp"
 #include "net/winhttp_pool.hpp"
 
@@ -146,9 +148,23 @@ public:
         const nlohmann::json& args = nlohmann::json::object(),
         void* ownerHwnd = nullptr);
 
-    // ==================== Background Worker Orchestration ====================
+    // ==================== Background Worker & Built-in Creative Workflows ====================
     bool isBusy() const noexcept { return workerBusy_.load(std::memory_order_acquire); }
     void startReplaceJob(const fs::path& outputTarget, std::string overrideInstruction);
+    void startPromptDrawJob(PromptDrawTaskConfig task);
+    void startRetouchJob(RetouchTaskConfig task);
+
+    // Thread-safe synchronous execution helpers for sub-workbench windows that run their own cancelable worker thread
+    std::vector<fs::path> runPromptDrawSync(
+        const PromptDrawTaskConfig& task,
+        net::CancelToken& cancel,
+        const ReplaceProgressFn& onProgress = {});
+
+    std::vector<fs::path> runRetouchSync(
+        const RetouchTaskConfig& task,
+        net::CancelToken& cancel,
+        const ReplaceProgressFn& onProgress = {});
+
     void startFetchModels();
     void cancelActiveJob() noexcept;
     void waitForIdle() noexcept;

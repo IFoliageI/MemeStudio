@@ -137,14 +137,25 @@ async function main() {
     assert.equal(gifMeta.animated, true);
     assert.equal(gifMeta.loop, 0);
 
-    // 2. Start ephemeral loopback Mock OpenAI server
+    // 2. Start ephemeral loopback Mock OpenAI server (supporting models, generations, and edits + SSE)
     let editRequests = 0;
+    let genRequests = 0;
     server = http.createServer((req, res) => {
       if (req.url === '/v1/models' && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           data: [{ id: 'gpt-image-1' }, { id: 'custom-meme-v2' }, { id: 'gpt-image-1' }]
         }));
+        return;
+      }
+      if (req.url === '/v1/images/generations' && req.method === 'POST') {
+        req.on('data', () => {});
+        req.on('end', () => {
+          genRequests++;
+          const b64 = returnedPng.toString('base64');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ data: [{ b64_json: b64 }] }));
+        });
         return;
       }
       if (req.url === '/v1/images/edits' && req.method === 'POST') {
@@ -225,7 +236,48 @@ async function main() {
     assert.equal(outGifMeta.frames, 2);
     assert.equal(editRequests, 4); // 2 copies * 1 frame + 2 GIF frames = 4 API calls
 
-    console.log('MemeStudio CLI E2E test suite passed (zero residue).');
+    // 6. Test built-in `draw` (pure prompt -> /v1/images/generations JSON)
+    const drawnPng = path.join(sandbox, 'drawn.png');
+    const drawRes = await runCli([
+      'draw',
+      '--base-url', baseUrl,
+      '--api-key', 'sk-local-test',
+      '--prompt', 'A happy sticker cat waving',
+      '--output', drawnPng
+    ], sandbox);
+    assert.equal(drawRes.status, 0, drawRes.stderr);
+    assert.ok(fs.existsSync(drawnPng));
+    assert.equal(genRequests, 1);
+
+    // 7. Test built-in `retouch` in BOTH prompt-guided full-image mode AND region-locked mode!
+    const retPromptPng = path.join(sandbox, 'retouched_prompt.png');
+    const retPromptRes = await runCli([
+      'retouch',
+      '--base-url', baseUrl,
+      '--api-key', 'sk-local-test',
+      '--source', srcPng,
+      '--output', retPromptPng,
+      '--mode', 'prompt',
+      '--prompt', '给角色戴上一副黑色墨镜'
+    ], sandbox);
+    assert.equal(retPromptRes.status, 0, retPromptRes.stderr);
+    assert.ok(fs.existsSync(retPromptPng));
+
+    const retRegionPng = path.join(sandbox, 'retouched_region.png');
+    const retRegionRes = await runCli([
+      'retouch',
+      '--base-url', baseUrl,
+      '--api-key', 'sk-local-test',
+      '--source', srcPng,
+      '--output', retRegionPng,
+      '--region', '0.5,0.5,0.5,0.5',
+      '--prompt', '修复右下角手部细节'
+    ], sandbox);
+    assert.equal(retRegionRes.status, 0, retRegionRes.stderr);
+    assert.ok(fs.existsSync(retRegionPng));
+    assert.equal(editRequests, 6);
+
+    console.log('MemeStudio CLI E2E test suite passed (run + draw + retouch, zero residue).');
   } finally {
     if (server) {
       await new Promise((resolve) => server.close(resolve));

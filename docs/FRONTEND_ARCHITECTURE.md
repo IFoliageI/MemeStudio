@@ -1,22 +1,21 @@
 # 前后端解耦与 WinUI 3 / 多前端升级指南
 
-`MemeStudio` 采用彻底的前后端分层架构：所有图像/GIF 编解码、OpenAI 兼容网络池、DPAPI 加密配置、多源任务队列以及插件宿主均封装在完全无界面依赖的后端控制器 `meme::core::StudioSession` 中，并通过 **`MemeStudioEngine.dll`（`sdk/memestudio_engine.h`）** 暴露稳定的纯 C ABI。
+`MemeStudio` 采用前后端彻底解耦架构：三大核心创作引擎（**角色替换**、**提示词生图**、**局部精修与提示词修图**）、多源素材队列（`<- [ 1 ] / N ->`）、WIC 防闪烁编解码器、WinHTTP 连接池、DPAPI 凭据存储与插件宿主均封装在无界面依赖的 `meme::core::StudioSession` 中，并通过 **`MemeStudioEngine.dll`（`sdk/memestudio_engine.h`）** 暴露跨语言纯 C ABI。
 
-## 1. 分层架构边界
+## 1. 模块分层边界
 
-- **`meme_core`（静态内核）**：包含 `StudioSession`、`ReplaceEngine`、`WicCodec`（内置直出预乘 `PARGB32` 像素转换）、`WinHttpPool` 与 `PluginHost`，不链接 `user32` / `gdi32` / `comctl32`。
-- **`MemeStudioEngine.dll`（跨语言引擎动态库）**：提供 100% 纯 C 导出接口（`extern "C"`），屏蔽 C++ STL ABI 差异，供 **WinUI 3（C# .NET `LibraryImport` 或 C++/WinRT）**、**Tauri（Rust FFI）** 或 **Qt 6** 直接加载。
-- **前端视图层（随时可替换）**：当前内置轻量化 Win32 `PerMonitorV2` 前端（`src/gui/`），仅负责控件渲染、输入采集与 `WM_SESSION_EVENT` 消息刷新。
+- **`meme_core`（无头静态内核）**：包含 `StudioSession`、`ReplaceEngine`、`DrawEngine`、`RetouchEngine`、`WicCodec`（内置直出预乘 `PARGB32` 像素转换）、`WinHttpPool` 与 `PluginHost`，完全不依赖 `user32` / `gdi32` / `comctl32`。
+- **`MemeStudioEngine.dll`（跨语言 C ABI 引擎库）**：屏蔽 C++ STL 内存布局差异，供 **WinUI 3（C# .NET `LibraryImport` 或 C++/WinRT）**、**Tauri（Rust FFI）** 或 **Qt 6** 直接调用。
+- **薄视图层（可随时替换）**：当前内置的极简 Win32 高分屏界面（`src/gui/`）仅负责渲染控件与转发用户输入。
 
-## 2. 接入 WinUI 3（Windows App SDK）的标准方式
+## 2. 接入 WinUI 3（Windows App SDK）的标准流程
 
-### 2.1 会话与实时事件流绑定
-1. 启动时调用 `meme_session_create(onEventCallback, userData, &session, &err)`。
-2. 在 `onEventCallback` 中通过 WinUI 3 `DispatcherQueue.TryEnqueue` 将后台发出的 JSON 事件（`progress`、`job_succeeded`、`job_failed`、`models_fetched`、`endpoint_override_changed`、`present_output`、`log`）切回 UI 线程更新 `ObservableObject` ViewModel。
-
-### 2.2 零编码损耗的 60fps 图像与 GIF 预览
-调用 `meme_session_read_frame_pargb32` 可直接将当前激活源表情（支持 `<- [ 1 ] / N ->` 多源队列切换）、人物参考图或生成结果的指定帧以 **预乘 `BGRA8`（`PARGB32`）** 写入 WinUI 3 `WriteableBitmap.PixelBuffer`（或 Win2D `CanvasBitmap`），无需经过磁盘文件或 PNG Base64 二次编解码。
-
-### 2.3 独立插件在 WinUI 3 下的双轨兼容
-1. **首日无缝兼容（`IWindowNative`）**：通过 `WinRT.Interop.WindowNative.GetWindowHandle(mainWindow)` 取得主窗口底层 `HWND`，传入 `meme_session_invoke_plugin(..., ownerHwnd, ...)`，所有现有插件弹窗即可直接作为受控子窗口弹出。
-2. **原生 Fluent XAML 自动渲染（`MEMESTUDIO_CMD_UI_SCHEMA`）**：WinUI 3 宿主可先向插件发送标准命令 `"get-ui-schema"`；若插件返回声明式表单 JSON（如 `memestudio.batch-convert` 已内置），前端可直接使用原生 Fluent XAML 控件渲染深浅色自适应界面，并在提交时调用 `submit_command`。
+1. **会话与异步事件订阅**：调用 `meme_session_create(onEvent, userData, &session, &err)` 创建会话；在 `onEvent` 中通过 `DispatcherQueue.TryEnqueue` 将 `progress`、`job_succeeded`、`job_failed`、`models_fetched`、`endpoint_override_changed`、`present_output`、`log` 等 JSON 事件切回 UI 线程刷新 ViewModel。
+2. **三大内置工作流一键触发**：
+   - 角色替换（支持单图与多源队列）：`meme_session_start_replace`
+   - 提示词生图：`meme_session_start_draw`
+   - 提示词修图 / 局部框选精修：`meme_session_start_retouch`
+3. **零编码损耗 60fps 预览**：调用 `meme_session_read_frame_pargb32` 直接将预乘 `BGRA8`（`PARGB32`）像素帧写入 WinUI 3 `WriteableBitmap.PixelBuffer` 或 Win2D `CanvasBitmap`。
+4. **插件面板双轨兼容**：
+   - 通过 `WinRT.Interop.WindowNative.GetWindowHandle(window)` 传入主窗口 `HWND`，现有插件弹窗首日即可作为受控子窗口正常弹出；
+   - 发送标准命令 `MEMESTUDIO_CMD_UI_SCHEMA` (`"get-ui-schema"`) 获取插件声明式表单描述，即可由 WinUI 3 宿主自动渲染原生 Fluent XAML 控件。

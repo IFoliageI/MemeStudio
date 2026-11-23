@@ -349,6 +349,22 @@ void testEngineCAbiAndMultiSourceNavigation(const std::filesystem::path& sandbox
     EXPECT(fw == 4 && fh == 4 && fcount == 1);
     EXPECT(pargb[0] == 100 && pargb[1] == 0 && pargb[2] == 0 && pargb[3] == 128);
 
+    // Verify dual-mode retouch prompt builder (PromptEdit vs RegionRedraw) & pixel-exact region lock
+    core::RetouchPromptSpec promptModeSpec;
+    promptModeSpec.mode = core::RetouchMode::PromptEdit;
+    promptModeSpec.userInstruction = "Add sunglasses";
+    std::string pEdit = core::buildImageRetouchPrompt(promptModeSpec);
+    EXPECT(pEdit.find("normalized rectangle") == std::string::npos);
+    EXPECT(pEdit.find("Add sunglasses") != std::string::npos);
+
+    core::RetouchPromptSpec regionModeSpec;
+    regionModeSpec.mode = core::RetouchMode::RegionRedraw;
+    regionModeSpec.region = {0.25, 0.25, 0.50, 0.50};
+    regionModeSpec.userInstruction = "Fix hand";
+    std::string pRegion = core::buildImageRetouchPrompt(regionModeSpec);
+    EXPECT(pRegion.find("normalized rectangle") != std::string::npos);
+    EXPECT(pRegion.find("Fix hand") != std::string::npos);
+
     meme_session_destroy(session);
 }
 

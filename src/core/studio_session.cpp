@@ -588,6 +588,112 @@ void StudioSession::startReplaceJob(const fs::path& outputTarget, std::string ov
     });
 }
 
+std::vector<fs::path> StudioSession::runPromptDrawSync(
+    const PromptDrawTaskConfig& task,
+    net::CancelToken& cancel,
+    const ReplaceProgressFn& onProgress) {
+    PromptDrawTaskConfig resolved = task;
+    if (resolved.provider.baseUrl.empty()) {
+        resolved.provider = effectiveProvider();
+    }
+    PluginHost* activePlugins = pluginHost_.get();
+    net::OpenAiImageClient client(httpPool_, [activePlugins](
+        std::string_view op, const net::ProviderConfig& prov, const nlohmann::json& meta,
+        std::span<const net::UploadPart> ups, net::CancelToken& c,
+        const net::ImagePreviewFn& prev, base::Bytes& resp) {
+        return activePlugins && activePlugins->tryInterceptApi(op, prov, meta, ups, c, prev, resp);
+    });
+    auto outs = runPromptDrawJob(resolved, client, activePlugins, cancel, onProgress);
+    setResultFiles(outs);
+    return outs;
+}
+
+std::vector<fs::path> StudioSession::runRetouchSync(
+    const RetouchTaskConfig& task,
+    net::CancelToken& cancel,
+    const ReplaceProgressFn& onProgress) {
+    RetouchTaskConfig resolved = task;
+    if (resolved.provider.baseUrl.empty()) {
+        resolved.provider = effectiveProvider();
+    }
+    PluginHost* activePlugins = pluginHost_.get();
+    net::OpenAiImageClient client(httpPool_, [activePlugins](
+        std::string_view op, const net::ProviderConfig& prov, const nlohmann::json& meta,
+        std::span<const net::UploadPart> ups, net::CancelToken& c,
+        const net::ImagePreviewFn& prev, base::Bytes& resp) {
+        return activePlugins && activePlugins->tryInterceptApi(op, prov, meta, ups, c, prev, resp);
+    });
+    auto outs = runImageRetouchJob(resolved, client, activePlugins, cancel, onProgress);
+    setResultFiles(outs);
+    return outs;
+}
+
+void StudioSession::startPromptDrawJob(PromptDrawTaskConfig task) {
+    if (isBusy()) throw Error("当前已有生成任务正在运行");
+    if (task.provider.baseUrl.empty()) task.provider = effectiveProvider();
+
+    if (workerThread_.joinable()) workerThread_.join();
+    cancelToken_.reset();
+    workerBusy_.store(true, std::memory_order_release);
+
+    workerThread_ = std::thread([this, task = std::move(task)]() {
+        HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        try {
+            auto outs = runPromptDrawSync(task, cancelToken_, [this](const ReplaceProgress& prog) {
+                SessionEvent ev;
+                ev.kind = SessionEvent::Kind::Progress;
+                ev.progress = prog;
+                emit(std::move(ev));
+            });
+            workerBusy_.store(false, std::memory_order_release);
+            SessionEvent doneEv;
+            doneEv.kind = SessionEvent::Kind::JobSucceeded;
+            doneEv.outputs = std::move(outs);
+            emit(std::move(doneEv));
+        } catch (const std::exception& e) {
+            workerBusy_.store(false, std::memory_order_release);
+            SessionEvent failEv;
+            failEv.kind = SessionEvent::Kind::JobFailed;
+            failEv.message = e.what();
+            emit(std::move(failEv));
+        }
+        if (SUCCEEDED(comHr)) CoUninitialize();
+    });
+}
+
+void StudioSession::startRetouchJob(RetouchTaskConfig task) {
+    if (isBusy()) throw Error("当前已有生成任务正在运行");
+    if (task.provider.baseUrl.empty()) task.provider = effectiveProvider();
+
+    if (workerThread_.joinable()) workerThread_.join();
+    cancelToken_.reset();
+    workerBusy_.store(true, std::memory_order_release);
+
+    workerThread_ = std::thread([this, task = std::move(task)]() {
+        HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        try {
+            auto outs = runRetouchSync(task, cancelToken_, [this](const ReplaceProgress& prog) {
+                SessionEvent ev;
+                ev.kind = SessionEvent::Kind::Progress;
+                ev.progress = prog;
+                emit(std::move(ev));
+            });
+            workerBusy_.store(false, std::memory_order_release);
+            SessionEvent doneEv;
+            doneEv.kind = SessionEvent::Kind::JobSucceeded;
+            doneEv.outputs = std::move(outs);
+            emit(std::move(doneEv));
+        } catch (const std::exception& e) {
+            workerBusy_.store(false, std::memory_order_release);
+            SessionEvent failEv;
+            failEv.kind = SessionEvent::Kind::JobFailed;
+            failEv.message = e.what();
+            emit(std::move(failEv));
+        }
+        if (SUCCEEDED(comHr)) CoUninitialize();
+    });
+}
+
 void StudioSession::startFetchModels() {
     if (isBusy()) throw Error("当前已有后台任务正在运行");
     net::ProviderConfig prov = effectiveProvider();
