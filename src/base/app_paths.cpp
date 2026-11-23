@@ -26,6 +26,15 @@ fs::path appDataRoot() {
             return g_overrideRoot;
         }
     }
+    DWORD envLen = GetEnvironmentVariableW(L"MEMESTUDIO_DATA_DIR", nullptr, 0);
+    if (envLen > 1) {
+        std::wstring envBuf(envLen, L'\0');
+        DWORD copied = GetEnvironmentVariableW(L"MEMESTUDIO_DATA_DIR", envBuf.data(), envLen);
+        if (copied > 0 && copied < envLen) {
+            envBuf.resize(copied);
+            return fs::path(envBuf);
+        }
+    }
     PWSTR directory = nullptr;
     HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &directory);
     if (FAILED(hr) || !directory) {
