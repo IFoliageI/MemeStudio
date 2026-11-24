@@ -344,7 +344,7 @@ net::ProviderConfig StudioSession::effectiveProvider() const {
     if (activeOverride_.has_value()) {
         prov.baseUrl = activeOverride_->baseUrl;
         if (!activeOverride_->apiKey.empty()) prov.apiKey = activeOverride_->apiKey;
-        if (!activeOverride_->model.empty() && prov.model.empty()) prov.model = activeOverride_->model;
+        if (!activeOverride_->model.empty()) prov.model = activeOverride_->model;
     }
     if (prov.apiKey.empty()) {
         auto envKey = base::readEnvSecret("OPENAI_API_KEY");

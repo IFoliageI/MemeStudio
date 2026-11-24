@@ -166,8 +166,8 @@ HttpResponse WinHttpPool::send(
     CancelToken& cancel,
     const std::function<void(const SseEvent&)>& onSseEvent) {
     cancel.verify();
-    if (spec.timeoutSeconds < 5 || spec.timeoutSeconds > 3600) {
-        throw Error("网络请求超时时间必须在 5 到 3600 秒之间");
+    if (spec.timeoutSeconds < 1 || spec.timeoutSeconds > 3600) {
+        throw Error("网络请求超时时间必须在 1 到 3600 秒之间");
     }
 
     CrackedUrl parsed = parseAndValidateUrl(spec.url, spec.allowLoopbackHttp);

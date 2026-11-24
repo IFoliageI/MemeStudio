@@ -892,8 +892,29 @@ bool PluginHost::tryInterceptApi(
     net::CancelToken& cancel,
     const net::ImagePreviewFn& onPreview,
     base::Bytes& outResponseBytes) const {
+    // Prioritize whichever plugin currently owns the active session endpoint override (e.g. local engine takeover)
+    // before general transport routers (e.g. multi-channel load balancer)!
+    std::string overrideOwnerId;
+    {
+        std::lock_guard lock(stateMutex_);
+        if (endpointOverride_.has_value()) {
+            overrideOwnerId = endpointOverride_->pluginId;
+        }
+    }
+    std::vector<const LoadedModule*> orderedModules;
+    orderedModules.reserve(modules_.size());
     for (const auto& m : modules_) {
-        if (!m->descriptor->intercept_image_api) continue;
+        if (m->descriptor->intercept_image_api && m->manifest.id == overrideOwnerId) {
+            orderedModules.push_back(m.get());
+        }
+    }
+    for (const auto& m : modules_) {
+        if (m->descriptor->intercept_image_api && m->manifest.id != overrideOwnerId) {
+            orderedModules.push_back(m.get());
+        }
+    }
+
+    for (const LoadedModule* m : orderedModules) {
 
         nlohmann::json provJson{
             {"base_url", provider.baseUrl},
