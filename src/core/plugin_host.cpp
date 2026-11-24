@@ -301,6 +301,7 @@ MemeStudioHostV2 PluginHost::makeHostTable(PluginHost* self) {
     t.is_cancelled = [](const MemeStudioCancelTokenV2* token) -> int32_t {
         if (!token) return 0;
         const auto* ct = reinterpret_cast<const net::CancelToken*>(token);
+        if (!ct->hasValidAbiMagic()) return 0;
         return ct->isStopped() ? 1 : 0;
     };
     t.get_data_dir = [](void*, const char* pluginId, MemeStudioBytesV2* outPath) -> int32_t {
@@ -365,7 +366,8 @@ MemeStudioHostV2 PluginHost::makeHostTable(PluginHost* self) {
             }
 
             net::CancelToken localCancel;
-            auto& activeCancel = cancelTok ? *reinterpret_cast<net::CancelToken*>(cancelTok) : localCancel;
+            auto* incomingCancel = reinterpret_cast<net::CancelToken*>(cancelTok);
+            auto& activeCancel = (incomingCancel && incomingCancel->hasValidAbiMagic()) ? *incomingCancel : localCancel;
 
             net::HttpResponse resp = host->httpPool_.send(spec, activeCancel, [&](const net::SseEvent& ev) {
                 if (onSse) {
@@ -580,7 +582,8 @@ MemeStudioHostV2 PluginHost::makeHostTable(PluginHost* self) {
             ReplaceTaskConfig cfg = parseReplaceTaskConfig(doc);
 
             net::CancelToken localCancel;
-            auto& activeCancel = cancelTok ? *reinterpret_cast<net::CancelToken*>(cancelTok) : localCancel;
+            auto* incomingCancel = reinterpret_cast<net::CancelToken*>(cancelTok);
+            auto& activeCancel = (incomingCancel && incomingCancel->hasValidAbiMagic()) ? *incomingCancel : localCancel;
 
             net::OpenAiImageClient client(host->httpPool_, [host](
                 std::string_view op,

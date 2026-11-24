@@ -18,14 +18,18 @@ class ActiveHttpSlot;
 // Unified thread-safe cancellation token supporting both concurrent WinHTTP requests
 // and managed child processes without handle ABA races.
 class CancelToken {
+    static constexpr uint64_t kAbiMagic = 0x4D454D4543414E43ull; // "MEMECANC"
+    uint64_t abiMagic_ = kAbiMagic;
     base::ProcessCancelSignal procSignal_;
     mutable std::mutex mutex_;
     std::vector<std::weak_ptr<ActiveHttpSlot>> activeSlots_;
 public:
     CancelToken() = default;
-    ~CancelToken() { stop(); }
+    ~CancelToken() { stop(); abiMagic_ = 0; }
     CancelToken(const CancelToken&) = delete;
     CancelToken& operator=(const CancelToken&) = delete;
+
+    bool hasValidAbiMagic() const noexcept { return abiMagic_ == kAbiMagic; }
 
     void stop() noexcept;
     void reset() noexcept;
